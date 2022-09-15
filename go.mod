@@ -10,7 +10,7 @@ require (
 	github.com/google/go-cmp v0.5.6
 	github.com/google/trillian v1.4.0
 	github.com/gorilla/mux v1.8.0
-	github.com/juju/ratelimit v1.0.1
+	github.com/juju/ratelimit v1.0.2
 	github.com/kylelemons/godebug v1.1.0
 	github.com/mattn/go-sqlite3 v1.14.8
 	github.com/mohae/deepcopy v0.0.0-20170929034955-c48cc78d4826
