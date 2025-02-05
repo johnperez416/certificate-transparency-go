@@ -32,10 +32,11 @@ import (
 	ct "github.com/google/certificate-transparency-go"
 	"github.com/google/certificate-transparency-go/internal/witness/api"
 	"github.com/google/certificate-transparency-go/tls"
-	"github.com/google/trillian/merkle/logverifier"
-	"github.com/google/trillian/merkle/rfc6962"
+	"github.com/transparency-dev/merkle/proof"
+	"github.com/transparency-dev/merkle/rfc6962"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"k8s.io/klog/v2"
 )
 
 // Opts is the options passed to a witness.
@@ -83,7 +84,8 @@ func New(wo Opts) (*Witness, error) {
 }
 
 // parse verifies the STH under the appropriate key for logID and returns
-// the parsed STH.
+// the parsed STH.  If the STH contained an incorrect logID the witness returns
+// an error indicating this, and if the logID is missing the witness fills it in.
 // This assumes sthRaw parses as a SignedTreeHead (not a CosignedSTH), so STHs are
 // stored unsigned and signed only right when they are being returned.
 func (w *Witness) parse(sthRaw []byte, logID string) (*ct.SignedTreeHead, error) {
@@ -91,18 +93,24 @@ func (w *Witness) parse(sthRaw []byte, logID string) (*ct.SignedTreeHead, error)
 	if !ok {
 		return nil, fmt.Errorf("log %q not found", logID)
 	}
-	var sthJSON ct.GetSTHResponse
-	if err := json.Unmarshal(sthRaw, &sthJSON); err != nil {
+	var sth ct.SignedTreeHead
+	if err := json.Unmarshal(sthRaw, &sth); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal json: %v", err)
 	}
-	sth, err := sthJSON.ToSignedTreeHead()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create STH: %v", err)
+	var idHash ct.SHA256Hash
+	if err := idHash.FromBase64String(logID); err != nil {
+		return nil, fmt.Errorf("failed to decode logID: %v", err)
 	}
-	if err := sv.VerifySTHSignature(*sth); err != nil {
+	var empty ct.SHA256Hash
+	if bytes.Equal(sth.LogID[:], empty[:]) {
+		sth.LogID = idHash
+	} else if !bytes.Equal(sth.LogID[:], idHash[:]) {
+		return nil, status.Errorf(codes.FailedPrecondition, "STH logID = %q, input logID = %q", sth.LogID.Base64String(), logID)
+	}
+	if err := sv.VerifySTHSignature(sth); err != nil {
 		return nil, fmt.Errorf("failed to verify STH signature: %v", err)
 	}
-	return sth, nil
+	return &sth, nil
 }
 
 // GetLogs returns a list of all logs the witness is aware of.
@@ -111,8 +119,11 @@ func (w *Witness) GetLogs() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
+	defer func() {
+		if err := rows.Close(); err != nil {
+			klog.Errorf("Operation to close rows failed: %v", err)
+		}
+	}()
 	var logs []string
 	for rows.Next() {
 		var logID string
@@ -149,7 +160,7 @@ func (w *Witness) GetSTH(logID string) ([]byte, error) {
 // Update updates the latest STH if nextRaw is consistent with the current
 // latest one for this log. It returns the latest cosigned STH held by
 // the witness, which is a signed version of nextRaw if the update was applied.
-func (w *Witness) Update(ctx context.Context, logID string, nextRaw []byte, proof [][]byte) ([]byte, error) {
+func (w *Witness) Update(ctx context.Context, logID string, nextRaw []byte, pf [][]byte) ([]byte, error) {
 	// If we don't witness this log then no point in going further.
 	_, ok := w.Logs[logID]
 	if !ok {
@@ -167,6 +178,12 @@ func (w *Witness) Update(ctx context.Context, logID string, nextRaw []byte, proo
 	if err != nil {
 		return nil, fmt.Errorf("couldn't create db tx: %v", err)
 	}
+	defer func() {
+		if err := tx.Rollback(); err != nil {
+			klog.Errorf("Rollback(): %v", err)
+		}
+	}()
+
 	// Get the latest STH (if one exists).
 	prevRaw, err := w.getLatestSTH(tx.QueryRow, logID)
 	if err != nil {
@@ -202,8 +219,7 @@ func (w *Witness) Update(ctx context.Context, logID string, nextRaw []byte, proo
 	}
 	// The only remaining option is next.Size > prev.Size. This might be
 	// valid so we verify the consistency proof.
-	logV := logverifier.New(rfc6962.DefaultHasher)
-	if err := logV.VerifyConsistencyProof(int64(prev.TreeSize), int64(next.TreeSize), prev.SHA256RootHash[:], next.SHA256RootHash[:], proof); err != nil {
+	if err := proof.VerifyConsistency(rfc6962.DefaultHasher, prev.TreeSize, next.TreeSize, pf, prev.SHA256RootHash[:], next.SHA256RootHash[:]); err != nil {
 		// Complain if the STHs aren't consistent.
 		return prevRaw, status.Errorf(codes.FailedPrecondition, "failed to verify consistency proof: %v", err)
 	}
@@ -257,8 +273,8 @@ func (w *Witness) getLatestSTH(queryRow func(query string, args ...interface{}) 
 
 // setSTH writes the STH to the database for a given log.
 func (w *Witness) setSTH(tx *sql.Tx, logID string, sth []byte) error {
-	tx.Exec(`INSERT INTO sths (logID, sth) VALUES (?, ?)
-		 ON CONFLICT(logID) DO UPDATE SET sth=excluded.sth`,
-		logID, sth)
+	if _, err := tx.Exec(`INSERT OR REPLACE INTO sths (logID, sth) VALUES (?, ?)`, logID, sth); err != nil {
+		return fmt.Errorf("failed to update STH; %v", err)
+	}
 	return tx.Commit()
 }

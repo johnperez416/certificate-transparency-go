@@ -18,6 +18,10 @@ package main
 import (
 	"context"
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/rsa"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"net/http"
@@ -28,8 +32,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/golang/glog"
 	"github.com/google/certificate-transparency-go/trillian/ctfe"
+	"github.com/google/certificate-transparency-go/trillian/ctfe/cache"
 	"github.com/google/certificate-transparency-go/trillian/ctfe/configpb"
 	"github.com/google/trillian"
 	"github.com/google/trillian/crypto/keys"
@@ -45,38 +49,47 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/client/v3/naming/endpoints"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/balancer/roundrobin"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/resolver/manual"
 	"google.golang.org/protobuf/proto"
+	"k8s.io/klog/v2"
 )
 
 // Global flags that affect all log instances.
 var (
-	httpEndpoint       = flag.String("http_endpoint", "localhost:6962", "Endpoint for HTTP (host:port)")
-	metricsEndpoint    = flag.String("metrics_endpoint", "", "Endpoint for serving metrics; if left empty, metrics will be visible on --http_endpoint")
-	rpcBackend         = flag.String("log_rpc_server", "", "Backend specification; comma-separated list or etcd service name (if --etcd_servers specified). If unset backends are specified in config (as a LogMultiConfig proto)")
-	rpcDeadline        = flag.Duration("rpc_deadline", time.Second*10, "Deadline for backend RPC requests")
-	getSTHInterval     = flag.Duration("get_sth_interval", time.Second*180, "Interval between internal get-sth operations (0 to disable)")
-	logConfig          = flag.String("log_config", "", "File holding log config in text proto format")
-	maxGetEntries      = flag.Int64("max_get_entries", 0, "Max number of entries we allow in a get-entries request (0=>use default 1000)")
-	etcdServers        = flag.String("etcd_servers", "", "A comma-separated list of etcd servers")
-	etcdHTTPService    = flag.String("etcd_http_service", "trillian-ctfe-http", "Service name to announce our HTTP endpoint under")
-	etcdMetricsService = flag.String("etcd_metrics_service", "trillian-ctfe-metrics-http", "Service name to announce our HTTP metrics endpoint under")
-	maskInternalErrors = flag.Bool("mask_internal_errors", false, "Don't return error strings with Internal Server Error HTTP responses")
-	tracing            = flag.Bool("tracing", false, "If true opencensus Stackdriver tracing will be enabled. See https://opencensus.io/.")
-	tracingProjectID   = flag.String("tracing_project_id", "", "project ID to pass to stackdriver. Can be empty for GCP, consult docs for other platforms.")
-	tracingPercent     = flag.Int("tracing_percent", 0, "Percent of requests to be traced. Zero is a special case to use the DefaultSampler")
-	quotaRemote        = flag.Bool("quota_remote", true, "Enable requesting of quota for IP address sending incoming requests")
-	quotaIntermediate  = flag.Bool("quota_intermediate", true, "Enable requesting of quota for intermediate certificates in sumbmitted chains")
-	handlerPrefix      = flag.String("handler_prefix", "", "If set e.g. to '/logs' will prefix all handlers that don't define a custom prefix")
-	pkcs11ModulePath   = flag.String("pkcs11_module_path", "", "Path to the PKCS#11 module to use for keys that use the PKCS#11 interface")
+	httpEndpoint          = flag.String("http_endpoint", "localhost:6962", "Endpoint for HTTP (host:port)")
+	httpIdleTimeout       = flag.Duration("http_idle_timeout", -1*time.Second, "Timeout after which idle connections will be closed by server")
+	tlsCert               = flag.String("tls_certificate", "", "Path to server TLS certificate")
+	tlsKey                = flag.String("tls_key", "", "Path to server TLS private key")
+	metricsEndpoint       = flag.String("metrics_endpoint", "", "Endpoint for serving metrics; if left empty, metrics will be visible on --http_endpoint")
+	rpcBackend            = flag.String("log_rpc_server", "", "Backend specification; comma-separated list or etcd service name (if --etcd_servers specified). If unset backends are specified in config (as a LogMultiConfig proto)")
+	rpcDeadline           = flag.Duration("rpc_deadline", time.Second*10, "Deadline for backend RPC requests")
+	getSTHInterval        = flag.Duration("get_sth_interval", time.Second*180, "Interval between internal get-sth operations (0 to disable)")
+	logConfig             = flag.String("log_config", "", "File holding log config in text proto format")
+	maxGetEntries         = flag.Int64("max_get_entries", 0, "Max number of entries we allow in a get-entries request (0=>use default 1000)")
+	etcdServers           = flag.String("etcd_servers", "", "A comma-separated list of etcd servers")
+	etcdHTTPService       = flag.String("etcd_http_service", "trillian-ctfe-http", "Service name to announce our HTTP endpoint under")
+	etcdMetricsService    = flag.String("etcd_metrics_service", "trillian-ctfe-metrics-http", "Service name to announce our HTTP metrics endpoint under")
+	maskInternalErrors    = flag.Bool("mask_internal_errors", false, "Don't return error strings with Internal Server Error HTTP responses")
+	tracing               = flag.Bool("tracing", false, "If true opencensus Stackdriver tracing will be enabled. See https://opencensus.io/.")
+	tracingProjectID      = flag.String("tracing_project_id", "", "project ID to pass to stackdriver. Can be empty for GCP, consult docs for other platforms.")
+	tracingPercent        = flag.Int("tracing_percent", 0, "Percent of requests to be traced. Zero is a special case to use the DefaultSampler")
+	quotaRemote           = flag.Bool("quota_remote", true, "Enable requesting of quota for IP address sending incoming requests")
+	quotaIntermediate     = flag.Bool("quota_intermediate", true, "Enable requesting of quota for intermediate certificates in submitted chains")
+	handlerPrefix         = flag.String("handler_prefix", "", "If set e.g. to '/logs' will prefix all handlers that don't define a custom prefix")
+	pkcs11ModulePath      = flag.String("pkcs11_module_path", "", "Path to the PKCS#11 module to use for keys that use the PKCS#11 interface")
+	cacheType             = flag.String("cache_type", "noop", "Supported cache type: noop, lru (Default: noop)")
+	cacheSize             = flag.Int("cache_size", -1, "Size parameter set to 0 makes cache of unlimited size")
+	cacheTTL              = flag.Duration("cache_ttl", -1*time.Second, "Providing 0 TTL turns expiring off")
+	trillianTLSCACertFile = flag.String("trillian_tls_ca_cert_file", "", "CA certificate file to use for secure connections with Trillian server")
 )
 
 const unknownRemoteUser = "UNKNOWN_REMOTE"
 
 // nolint:staticcheck
 func main() {
+	klog.InitFlags(nil)
 	flag.Parse()
 	ctx := context.Background()
 
@@ -109,76 +122,93 @@ func main() {
 	}
 
 	if err != nil {
-		glog.Exitf("Failed to read config: %v", err)
+		klog.Exitf("Failed to read config: %v", err)
 	}
 
 	beMap, err := ctfe.ValidateLogMultiConfig(cfg)
 	if err != nil {
-		glog.Exitf("Invalid config: %v", err)
+		klog.Exitf("Invalid config: %v", err)
 	}
 
-	glog.CopyStandardLogTo("WARNING")
-	glog.Info("**** CT HTTP Server Starting ****")
+	klog.CopyStandardLogTo("WARNING")
+	klog.Info("**** CT HTTP Server Starting ****")
 
 	metricsAt := *metricsEndpoint
 	if metricsAt == "" {
 		metricsAt = *httpEndpoint
 	}
 
-	dialOpts := []grpc.DialOption{grpc.WithInsecure()}
+	dialOpts := []grpc.DialOption{}
+	if *trillianTLSCACertFile != "" {
+		creds, err := credentials.NewClientTLSFromFile(*trillianTLSCACertFile, "")
+		if err != nil {
+			klog.Exitf("Failed to create TLS credentials from Trillian CA certificate: %v", err)
+		}
+		dialOpts = append(dialOpts, grpc.WithTransportCredentials(creds))
+	} else {
+		dialOpts = append(dialOpts, grpc.WithInsecure())
+	}
 	if len(*etcdServers) > 0 {
 		// Use etcd to provide endpoint resolution.
 		cfg := clientv3.Config{Endpoints: strings.Split(*etcdServers, ","), DialTimeout: 5 * time.Second}
 		client, err := clientv3.New(cfg)
 		if err != nil {
-			glog.Exitf("Failed to connect to etcd at %v: %v", *etcdServers, err)
+			klog.Exitf("Failed to connect to etcd at %v: %v", *etcdServers, err)
 		}
 
 		httpManager, err := endpoints.NewManager(client, *etcdHTTPService)
 		if err != nil {
-			glog.Exitf("Failed to create etcd http manager: %v", err)
+			klog.Exitf("Failed to create etcd http manager: %v", err)
 		}
 		metricsManager, err := endpoints.NewManager(client, *etcdMetricsService)
 		if err != nil {
-			glog.Exitf("Failed to create etcd metrics manager: %v", err)
+			klog.Exitf("Failed to create etcd metrics manager: %v", err)
 		}
 
 		etcdHTTPKey := fmt.Sprintf("%s/%s", *etcdHTTPService, *httpEndpoint)
-		glog.Infof("Announcing our presence at %v with %+v", etcdHTTPKey, *httpEndpoint)
-		httpManager.AddEndpoint(ctx, etcdHTTPKey, endpoints.Endpoint{Addr: *httpEndpoint})
+		klog.Infof("Announcing our presence at %v with %+v", etcdHTTPKey, *httpEndpoint)
+		if err := httpManager.AddEndpoint(ctx, etcdHTTPKey, endpoints.Endpoint{Addr: *httpEndpoint}); err != nil {
+			klog.Errorf("AddEndpoint(): %v", err)
+		}
 
 		etcdMetricsKey := fmt.Sprintf("%s/%s", *etcdMetricsService, metricsAt)
-		glog.Infof("Announcing our presence in %v with %+v", *etcdMetricsService, metricsAt)
-		metricsManager.AddEndpoint(ctx, etcdMetricsKey, endpoints.Endpoint{Addr: metricsAt})
+		klog.Infof("Announcing our presence in %v with %+v", *etcdMetricsService, metricsAt)
+		if err := metricsManager.AddEndpoint(ctx, etcdMetricsKey, endpoints.Endpoint{Addr: metricsAt}); err != nil {
+			klog.Errorf("AddEndpoint(): %v", err)
+		}
 
 		defer func() {
-			glog.Infof("Removing our presence in %v", etcdHTTPKey)
-			httpManager.DeleteEndpoint(ctx, etcdHTTPKey)
-			glog.Infof("Removing our presence in %v", etcdMetricsKey)
-			metricsManager.DeleteEndpoint(ctx, etcdMetricsKey)
+			klog.Infof("Removing our presence in %v", etcdHTTPKey)
+			if err := httpManager.DeleteEndpoint(ctx, etcdHTTPKey); err != nil {
+				klog.Errorf("DeleteEndpoint(): %v", err)
+			}
+			klog.Infof("Removing our presence in %v", etcdMetricsKey)
+			if err := metricsManager.DeleteEndpoint(ctx, etcdMetricsKey); err != nil {
+				klog.Errorf("DeleteEndpoint(): %v", err)
+			}
 		}()
 	} else if strings.Contains(*rpcBackend, ",") {
 		// This should probably not be used in production. Either use etcd or a gRPC
 		// load balancer. It's only used by the integration tests.
-		glog.Warning("Multiple RPC backends from flags not recommended for production. Should probably be using etcd or a gRPC load balancer / proxy.")
+		klog.Warning("Multiple RPC backends from flags not recommended for production. Should probably be using etcd or a gRPC load balancer / proxy.")
 		res := manual.NewBuilderWithScheme("whatever")
 		backends := strings.Split(*rpcBackend, ",")
-		addrs := make([]resolver.Address, 0, len(backends))
+		endpoints := make([]resolver.Endpoint, 0, len(backends))
 		for _, backend := range backends {
-			addrs = append(addrs, resolver.Address{Addr: backend, Type: resolver.Backend})
+			endpoints = append(endpoints, resolver.Endpoint{Addresses: []resolver.Address{{Addr: backend}}})
 		}
-		res.InitialState(resolver.State{Addresses: addrs})
+		res.InitialState(resolver.State{Endpoints: endpoints})
 		resolver.SetDefaultScheme(res.Scheme())
-		dialOpts = append(dialOpts, grpc.WithBalancerName(roundrobin.Name), grpc.WithResolvers(res))
+		dialOpts = append(dialOpts, grpc.WithDefaultServiceConfig(`{"loadBalancingConfig": [{"round_robin":{}}]}`), grpc.WithResolvers(res))
 	} else {
-		glog.Infof("Using regular DNS resolver")
-		dialOpts = append(dialOpts, grpc.WithBalancerName(roundrobin.Name))
+		klog.Infof("Using regular DNS resolver")
+		dialOpts = append(dialOpts, grpc.WithDefaultServiceConfig(`{"loadBalancingConfig": [{"round_robin":{}}]}`))
 	}
 
 	// Dial all our log backends.
 	clientMap := make(map[string]trillian.TrillianLogClient)
 	for _, be := range beMap {
-		glog.Infof("Dialling backend: %v", be)
+		klog.Infof("Dialling backend: %v", be)
 		if len(beMap) == 1 {
 			// If there's only one of them we use the blocking option as we can't
 			// serve anything until connected.
@@ -186,9 +216,13 @@ func main() {
 		}
 		conn, err := grpc.Dial(be.BackendSpec, dialOpts...)
 		if err != nil {
-			glog.Exitf("Could not dial RPC server: %v: %v", be, err)
+			klog.Exitf("Could not dial RPC server: %v: %v", be, err)
 		}
-		defer conn.Close()
+		defer func() {
+			if err := conn.Close(); err != nil {
+				klog.Errorf("Could not close RPC connection: %v", err)
+			}
+		}()
 		clientMap[be.Name] = trillian.NewTrillianLogClient(conn)
 	}
 
@@ -201,13 +235,48 @@ func main() {
 
 	// Register handlers for all the configured logs using the correct RPC
 	// client.
+	var publicKeys []crypto.PublicKey
 	for _, c := range cfg.LogConfigs.Config {
-		inst, err := setupAndRegister(ctx, clientMap[c.LogBackendName], *rpcDeadline, c, corsMux, *handlerPrefix, *maskInternalErrors)
+		inst, err := setupAndRegister(ctx,
+			clientMap[c.LogBackendName],
+			*rpcDeadline,
+			c,
+			corsMux,
+			*handlerPrefix,
+			*maskInternalErrors,
+			cache.Type(*cacheType),
+			cache.Option{
+				Size: *cacheSize,
+				TTL:  *cacheTTL,
+			},
+		)
 		if err != nil {
-			glog.Exitf("Failed to set up log instance for %+v: %v", cfg, err)
+			klog.Exitf("Failed to set up log instance for %+v: %v", cfg, err)
 		}
 		if *getSTHInterval > 0 {
 			go inst.RunUpdateSTH(ctx, *getSTHInterval)
+		}
+
+		// Ensure that this log does not share the same private key as any other
+		// log that has already been set up and registered.
+		if publicKey := inst.GetPublicKey(); publicKey != nil {
+			for _, p := range publicKeys {
+				switch pub := publicKey.(type) {
+				case *ecdsa.PublicKey:
+					if pub.Equal(p) {
+						klog.Exitf("Same private key used by more than one log")
+					}
+				case ed25519.PublicKey:
+					if pub.Equal(p) {
+						klog.Exitf("Same private key used by more than one log")
+					}
+				case *rsa.PublicKey:
+					if pub.Equal(p) {
+						klog.Exitf("Same private key used by more than one log")
+					}
+				}
+			}
+			publicKeys = append(publicKeys, publicKey)
 		}
 	}
 
@@ -223,7 +292,9 @@ func main() {
 	// Export a healthz target.
 	corsMux.HandleFunc("/healthz", func(resp http.ResponseWriter, req *http.Request) {
 		// TODO(al): Wire this up to tell the truth.
-		resp.Write([]byte("ok"))
+		if _, err := resp.Write([]byte("ok")); err != nil {
+			klog.Errorf("resp.Write(): %v", err)
+		}
 	})
 
 	if metricsAt != *httpEndpoint {
@@ -233,7 +304,7 @@ func main() {
 			mux.Handle("/metrics", promhttp.Handler())
 			metricsServer := http.Server{Addr: metricsAt, Handler: mux}
 			err := metricsServer.ListenAndServe()
-			glog.Warningf("Metrics server exited: %v", err)
+			klog.Warningf("Metrics server exited: %v", err)
 		}()
 	} else {
 		// Handle metrics on the DefaultServeMux.
@@ -245,12 +316,29 @@ func main() {
 	if *tracing {
 		handler, err = opencensus.EnableHTTPServerTracing(*tracingProjectID, *tracingPercent)
 		if err != nil {
-			glog.Exitf("Failed to initialize stackdriver / opencensus tracing: %v", err)
+			klog.Exitf("Failed to initialize stackdriver / opencensus tracing: %v", err)
 		}
 	}
 
 	// Bring up the HTTP server and serve until we get a signal not to.
-	srv := http.Server{Addr: *httpEndpoint, Handler: handler}
+	srv := http.Server{}
+	if *tlsCert != "" && *tlsKey != "" {
+		cert, err := tls.LoadX509KeyPair(*tlsCert, *tlsKey)
+		if err != nil {
+			klog.Errorf("failed to load TLS certificate/key: %v", err)
+		}
+		tlsConfig := &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}
+		srv = http.Server{Addr: *httpEndpoint, Handler: handler, TLSConfig: tlsConfig}
+	} else {
+		srv = http.Server{Addr: *httpEndpoint, Handler: handler}
+	}
+	if *httpIdleTimeout > 0 {
+		srv.IdleTimeout = *httpIdleTimeout
+	}
+
 	shutdownWG := new(sync.WaitGroup)
 	go awaitSignal(func() {
 		shutdownWG.Add(1)
@@ -258,19 +346,25 @@ func main() {
 		// Allow 60s for any pending requests to finish then terminate any stragglers
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*60)
 		defer cancel()
-		glog.Info("Shutting down HTTP server...")
-		srv.Shutdown(ctx)
-		glog.Info("HTTP server shutdown")
+		klog.Info("Shutting down HTTP server...")
+		if err := srv.Shutdown(ctx); err != nil {
+			klog.Errorf("srv.Shutdown(): %v", err)
+		}
+		klog.Info("HTTP server shutdown")
 	})
 
-	err = srv.ListenAndServe()
+	if *tlsCert != "" && *tlsKey != "" {
+		err = srv.ListenAndServeTLS("", "")
+	} else {
+		err = srv.ListenAndServe()
+	}
 	if err != http.ErrServerClosed {
-		glog.Warningf("Server exited: %v", err)
+		klog.Warningf("Server exited: %v", err)
 	}
 	// Wait will only block if the function passed to awaitSignal was called,
 	// in which case it'll block until the HTTP server has gracefully shutdown
 	shutdownWG.Wait()
-	glog.Flush()
+	klog.Flush()
 }
 
 // awaitSignal waits for standard termination signals, then runs the given
@@ -282,13 +376,13 @@ func awaitSignal(doneFn func()) {
 
 	// Now block main and wait for a signal
 	sig := <-sigs
-	glog.Warningf("Signal received: %v", sig)
-	glog.Flush()
+	klog.Warningf("Signal received: %v", sig)
+	klog.Flush()
 
 	doneFn()
 }
 
-func setupAndRegister(ctx context.Context, client trillian.TrillianLogClient, deadline time.Duration, cfg *configpb.LogConfig, mux *http.ServeMux, globalHandlerPrefix string, maskInternalErrors bool) (*ctfe.Instance, error) {
+func setupAndRegister(ctx context.Context, client trillian.TrillianLogClient, deadline time.Duration, cfg *configpb.LogConfig, mux *http.ServeMux, globalHandlerPrefix string, maskInternalErrors bool, cacheType cache.Type, cacheOption cache.Option) (*ctfe.Instance, error) {
 	vCfg, err := ctfe.ValidateLogConfig(cfg)
 	if err != nil {
 		return nil, err
@@ -301,9 +395,11 @@ func setupAndRegister(ctx context.Context, client trillian.TrillianLogClient, de
 		MetricFactory:      prometheus.MetricFactory{},
 		RequestLog:         new(ctfe.DefaultRequestLog),
 		MaskInternalErrors: maskInternalErrors,
+		CacheType:          cacheType,
+		CacheOption:        cacheOption,
 	}
 	if *quotaRemote {
-		glog.Info("Enabling quota for requesting IP")
+		klog.Info("Enabling quota for requesting IP")
 		opts.RemoteQuotaUser = func(r *http.Request) string {
 			var remoteUser = realip.FromRequest(r)
 			if len(remoteUser) == 0 {
@@ -313,7 +409,7 @@ func setupAndRegister(ctx context.Context, client trillian.TrillianLogClient, de
 		}
 	}
 	if *quotaIntermediate {
-		glog.Info("Enabling quota for intermediate certificates")
+		klog.Info("Enabling quota for intermediate certificates")
 		opts.CertificateQuotaUser = ctfe.QuotaUserForCert
 	}
 	// Full handler pattern will be of the form "/logs/yyz/ct/v1/add-chain", where "/logs" is the
@@ -325,7 +421,7 @@ func setupAndRegister(ctx context.Context, client trillian.TrillianLogClient, de
 	// log is at "/log/..." this is now supported.
 	lhp := globalHandlerPrefix
 	if ohPrefix := cfg.OverrideHandlerPrefix; len(ohPrefix) > 0 {
-		glog.Infof("Log with prefix: %s is using a custom HandlerPrefix: %s", cfg.Prefix, ohPrefix)
+		klog.Infof("Log with prefix: %s is using a custom HandlerPrefix: %s", cfg.Prefix, ohPrefix)
 		lhp = "/" + strings.Trim(ohPrefix, "/")
 	}
 	inst, err := ctfe.SetUpInstance(ctx, opts)

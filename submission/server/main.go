@@ -23,16 +23,16 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/golang/glog"
 	"github.com/google/certificate-transparency-go/submission"
 	"github.com/google/trillian/monitoring/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"k8s.io/klog/v2"
 )
 
 // Flags.
 var (
 	httpEndpoint             = flag.String("http_endpoint", "localhost:5951", "Endpoint for HTTP (host:port)")
-	logListPath              = flag.String("loglist_path", "https://www.gstatic.com/ct/log_list/v2/log_list.json", "Path for list of CT Logs in JSON format")
+	logListPath              = flag.String("loglist_path", "https://www.gstatic.com/ct/log_list/v3/log_list.json", "Path for list of CT Logs in JSON format")
 	logListRefreshInterval   = flag.Duration("loglist_refresh_interval", 24*time.Hour, "Interval between consecutive reads of Log-list")
 	rootsRefreshInterval     = flag.Duration("roots_refresh_interval", 24*time.Hour, "Interval between consecutive get-roots calls")
 	policyType               = flag.String("policy_type", "chrome", "CT-policy <chrome|apple>")
@@ -47,11 +47,12 @@ func parsePolicyType() submission.CTPolicyType {
 	} else if *policyType == "apple" {
 		return submission.AppleCTPolicy
 	}
-	glog.Fatalf("flag policyType does not support value %q", *policyType)
+	klog.Fatalf("flag policyType does not support value %q", *policyType)
 	return submission.ChromeCTPolicy
 }
 
 func main() {
+	klog.InitFlags(nil)
 	flag.Parse()
 
 	plc := parsePolicyType()

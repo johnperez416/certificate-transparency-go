@@ -31,7 +31,8 @@ import (
 ///////////////////////////////////////////////////////////////////////////////
 
 // LogEntryType represents the LogEntryType enum from section 3.1:
-//   enum { x509_entry(0), precert_entry(1), (65535) } LogEntryType;
+//
+//	enum { x509_entry(0), precert_entry(1), (65535) } LogEntryType;
 type LogEntryType tls.Enum // tls:"maxval:65535"
 
 // LogEntryType constants from section 3.1.
@@ -58,7 +59,8 @@ const (
 )
 
 // MerkleLeafType represents the MerkleLeafType enum from section 3.4:
-//   enum { timestamped_entry(0), (255) } MerkleLeafType;
+//
+//	enum { timestamped_entry(0), (255) } MerkleLeafType;
 type MerkleLeafType tls.Enum // tls:"maxval:255"
 
 // TimestampedEntryLeafType is the only defined MerkleLeafType constant from section 3.4.
@@ -74,7 +76,8 @@ func (m MerkleLeafType) String() string {
 }
 
 // Version represents the Version enum from section 3.2:
-//   enum { v1(0), (255) } Version;
+//
+//	enum { v1(0), (255) } Version;
 type Version tls.Enum // tls:"maxval:255"
 
 // CT Version constants from section 3.2.
@@ -92,7 +95,8 @@ func (v Version) String() string {
 }
 
 // SignatureType differentiates STH signatures from SCT signatures, see section 3.2.
-//   enum { certificate_timestamp(0), tree_hash(1), (255) } SignatureType;
+//
+//	enum { certificate_timestamp(0), tree_hash(1), (255) } SignatureType;
 type SignatureType tls.Enum // tls:"maxval:255"
 
 // SignatureType constants from section 3.2.
@@ -132,7 +136,7 @@ type PreCert struct {
 
 // CTExtensions is a representation of the raw bytes of any CtExtension
 // structure (see section 3.2).
-// nolint: golint
+// nolint: revive
 type CTExtensions []byte // tls:"minlen:0,maxlen:65535"`
 
 // MerkleTreeNode represents an internal node in the CT tree.
@@ -242,6 +246,21 @@ type PrecertChainEntry struct {
 // for get-entries (section 4.6).
 type CertificateChain struct {
 	Entries []ASN1Cert `tls:"minlen:0,maxlen:16777215"`
+}
+
+// PrecertChainEntryHash is an extended PrecertChainEntry type with the
+// IssuanceChainHash field added to store the hash of the
+// CertificateChain field of PrecertChainEntry.
+type PrecertChainEntryHash struct {
+	PreCertificate    ASN1Cert `tls:"minlen:1,maxlen:16777215"`
+	IssuanceChainHash []byte   `tls:"minlen:0,maxlen:256"`
+}
+
+// CertificateChainHash is an extended CertificateChain type with the
+// IssuanceChainHash field added to store the hash of the
+// Entries field of CertificateChain.
+type CertificateChainHash struct {
+	IssuanceChainHash []byte `tls:"minlen:0,maxlen:256"`
 }
 
 // JSONDataEntry holds arbitrary data.
@@ -551,7 +570,7 @@ type LeafEntry struct {
 	ExtraData []byte `json:"extra_data"`
 }
 
-// GetEntriesResponse respresents the JSON response to the get-entries GET method
+// GetEntriesResponse represents the JSON response to the get-entries GET method
 // from section 4.6.
 type GetEntriesResponse struct {
 	Entries []LeafEntry `json:"entries"` // the list of returned entries

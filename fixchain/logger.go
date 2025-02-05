@@ -30,7 +30,7 @@ import (
 // Limiter is an interface to allow different rate limiters to be used with the
 // Logger.
 type Limiter interface {
-	Wait()
+	Wait(context.Context) error
 }
 
 // Logger contains methods to asynchronously log certificate chains to a
@@ -139,7 +139,7 @@ type toPost struct {
 }
 
 // postToLog() is used during the initial queueing of chains to avoid spinning
-// up an excessive number of goroutines, and unecessarily using up memory. If
+// up an excessive number of goroutines, and unnecessarily using up memory. If
 // asyncPostToLog() was called instead, then every time a new chain was queued,
 // a new goroutine would be created, each holding their own chain - regardless
 // of whether there were postServers available to process them or not.  If a
@@ -163,7 +163,9 @@ func (l *Logger) postChain(p *toPost) {
 		derChain = append(derChain, ct.ASN1Cert{Data: cert.Raw})
 	}
 
-	l.limiter.Wait()
+	if err := l.limiter.Wait(l.ctx); err != nil {
+		log.Println(err)
+	}
 	atomic.AddUint32(&l.posted, 1)
 	_, err := l.client.AddChain(l.ctx, derChain)
 	if err != nil {

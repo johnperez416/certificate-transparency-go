@@ -71,7 +71,7 @@ this incorporation relies on a single point of failure (the
 [signer](ManualDeployment.md#primary-signer-election)).  As such, there are
 some CT-specific metrics that can also be alerted on:
 
- - The age of the most recent Merkle treee head.
+ - The age of the most recent Merkle tree head.
  - The size of the current backlog of unmerged submissions.
  - Per-log instance counts of primary signer instances (which is normally 1,
    can transiently be 0, but should never be > 1).
@@ -139,11 +139,11 @@ disqualification.
 ## Troubleshooting
 
 All of the Trillian and CTFE binaries use the
-[glog](https://github.com/golang/glog) library for logging, so additional
-diagnostic information can be obtained by modifying the glog options, for
+[klog](https://github.com/kubernetes/klog) library for logging, so additional
+diagnostic information can be obtained by modifying the klog options, for
 example, by enabling `--logtostderr -v 1`.
 
-Other useful glog options for debugging specific problems are:
+Other useful klog options for debugging specific problems are:
 
  - `--vmodule`: increase the logging level selectively in particular
    code files.

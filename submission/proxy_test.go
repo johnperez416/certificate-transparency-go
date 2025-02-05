@@ -19,7 +19,6 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"strings"
 	"testing"
@@ -27,7 +26,7 @@ import (
 
 	ct "github.com/google/certificate-transparency-go"
 	"github.com/google/certificate-transparency-go/client"
-	"github.com/google/certificate-transparency-go/loglist2"
+	"github.com/google/certificate-transparency-go/loglist3"
 	"github.com/google/certificate-transparency-go/testdata"
 	"github.com/google/certificate-transparency-go/tls"
 	"github.com/google/trillian/monitoring"
@@ -88,16 +87,20 @@ func (m stubNoRootsLogClient) GetAcceptedRoots(ctx context.Context) ([]ct.ASN1Ce
 	return nil, fmt.Errorf("stubNoRootsLogClient cannot provide roots")
 }
 
-func buildStubNoRootsLogClient(log *loglist2.Log) (client.AddLogClient, error) {
+func buildStubNoRootsLogClient(log *loglist3.Log) (client.AddLogClient, error) {
 	return stubNoRootsLogClient{logURL: log.URL}, nil
 }
 
 func TestProxyInitState(t *testing.T) {
-	f, err := createTempFile(testdata.SampleLogList)
+	f, err := createTempFile(testdata.SampleLogList3)
 	if err != nil {
-		t.Fatalf("createTempFile(%q) = (_, %q), want (_, nil)", testdata.SampleLogList, err)
+		t.Fatalf("createTempFile(%q) = (_, %q), want (_, nil)", testdata.SampleLogList3, err)
 	}
-	defer os.Remove(f)
+	defer func() {
+		if err := os.Remove(f); err != nil {
+			t.Fatalf("Operation to remove temp file failed: %v", err)
+		}
+	}()
 
 	llr := NewLogListRefresher(f)
 	p := NewProxy(NewLogListManager(llr, nil), GetDistributorBuilder(ChromeCTPolicy, buildStubNoRootsLogClient, imf), imf)
@@ -122,8 +125,8 @@ Init:
 		}
 	}
 
-	sampleLogListUpdate := strings.Replace(testdata.SampleLogList, "ct.googleapis.com/racketeer/", "ct.googleapis.com/racketeer/v2/", 1)
-	if err := ioutil.WriteFile(f, []byte(sampleLogListUpdate), 0644); err != nil {
+	sampleLogListUpdate := strings.Replace(testdata.SampleLogList3, "ct.googleapis.com/racketeer/", "ct.googleapis.com/racketeer/v2/", 1)
+	if err := os.WriteFile(f, []byte(sampleLogListUpdate), 0644); err != nil {
 		t.Fatalf("unable to update Log-list data file: %q", err)
 	}
 	ctx, cancel = context.WithTimeout(context.Background(), time.Second)

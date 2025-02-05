@@ -21,35 +21,30 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
 
 	wit_api "github.com/google/certificate-transparency-go/internal/witness/api"
+	"k8s.io/klog/v2"
 )
 
 // ErrSTHTooOld is returned if the STH passed to Update needs to be updated.
-var ErrSTHTooOld error = errors.New("STH too old")
-
-// WitnessSigVerifier verifies the witness' signature on a cosigned STH.
-type WitnessSigVerifier interface {
-	VerifySignature(cosigned wit_api.CosignedSTH) error
-}
+var ErrSTHTooOld = errors.New("STH too old")
 
 // Witness consists of the witness' URL and signature verifier.
 type Witness struct {
-	URL      *url.URL
-	Verifier WitnessSigVerifier
+	URL *url.URL
 }
 
 // GetLatestSTH returns a recent STH from the witness for the specified log ID.
 func (w Witness) GetLatestSTH(ctx context.Context, logID string) ([]byte, error) {
-	u, err := w.URL.Parse(fmt.Sprintf(wit_api.HTTPGetSTH, url.QueryEscape(logID)))
+	u, err := w.URL.Parse(fmt.Sprintf(wit_api.HTTPGetSTH, url.PathEscape(logID)))
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse URL: %v", err)
 	}
-	req, err := http.NewRequest("GET", u.String(), nil)
+	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %v", err)
 	}
@@ -57,13 +52,17 @@ func (w Witness) GetLatestSTH(ctx context.Context, logID string) ([]byte, error)
 	if err != nil {
 		return nil, fmt.Errorf("failed to do http request: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			klog.Errorf("Failed to close response body: %v", err)
+		}
+	}()
 	if resp.StatusCode == 404 {
 		return nil, os.ErrNotExist
 	} else if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("bad status response: %s", resp.Status)
 	}
-	return ioutil.ReadAll(resp.Body)
+	return io.ReadAll(resp.Body)
 }
 
 // Update attempts to clock the witness forward for the given logID.
@@ -77,11 +76,11 @@ func (w Witness) Update(ctx context.Context, logID string, sth []byte, proof [][
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal update request: %v", err)
 	}
-	u, err := w.URL.Parse(fmt.Sprintf(wit_api.HTTPUpdate, url.QueryEscape(logID)))
+	u, err := w.URL.Parse(fmt.Sprintf(wit_api.HTTPUpdate, url.PathEscape(logID)))
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse URL: %v", err)
 	}
-	req, err := http.NewRequest("PUT", u.String(), bytes.NewReader(reqBody))
+	req, err := http.NewRequest(http.MethodPut, u.String(), bytes.NewReader(reqBody))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %v", err)
 	}
@@ -89,8 +88,16 @@ func (w Witness) Update(ctx context.Context, logID string, sth []byte, proof [][
 	if err != nil {
 		return nil, fmt.Errorf("failed to do http request: %v", err)
 	}
-	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
+	if resp.Request.Method != "PUT" {
+		// https://developer.mozilla.org/en-US/docs/Web/HTTP/Redirections#permanent_redirections
+		return nil, fmt.Errorf("PUT request to %q was converted to %s request to %q", u.String(), resp.Request.Method, resp.Request.URL)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			klog.Errorf("Failed to close response body: %v", err)
+		}
+	}()
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read body: %v", err)
 	}

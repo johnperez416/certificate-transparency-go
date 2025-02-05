@@ -22,6 +22,11 @@ import (
 
 	"github.com/google/certificate-transparency-go/asn1"
 	"github.com/google/certificate-transparency-go/x509"
+	"github.com/google/certificate-transparency-go/x509util"
+)
+
+var (
+	ErrNoRFCCompliantPathFound = errors.New("no RFC compliant path to root found when trying to validate chain")
 )
 
 // IsPrecertificate tests if a certificate is a pre-certificate as defined in CT.
@@ -49,7 +54,7 @@ func IsPrecertificate(cert *x509.Certificate) (bool, error) {
 func ValidateChain(rawChain [][]byte, validationOpts CertValidationOpts) ([]*x509.Certificate, error) {
 	// First make sure the certs parse as X.509
 	chain := make([]*x509.Certificate, 0, len(rawChain))
-	intermediatePool := NewPEMCertPool()
+	intermediatePool := x509util.NewPEMCertPool()
 
 	for i, certBytes := range rawChain {
 		cert, err := x509.ParseCertificate(certBytes)
@@ -171,7 +176,7 @@ func ValidateChain(rawChain [][]byte, validationOpts CertValidationOpts) ([]*x50
 		}
 	}
 
-	return nil, errors.New("no RFC compliant path to root found when trying to validate chain")
+	return nil, ErrNoRFCCompliantPathFound
 }
 
 func chainsEquivalent(inChain []*x509.Certificate, verifiedChain []*x509.Certificate) bool {
