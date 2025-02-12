@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Binary scanlog allows an existing CT Log to be scanned for certificates of interest.
 package main
 
 import (
@@ -19,10 +20,10 @@ import (
 	"encoding/base64"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"math/big"
 	"net/http"
+	"os"
 	"path"
 	"regexp"
 	"time"
@@ -82,7 +83,7 @@ func dumpData(entry *ct.RawLogEntry) {
 	if len(entry.Cert.Data) > 0 {
 		name := fmt.Sprintf("%s-%014d-%s.der", prefix, entry.Index, suffix)
 		filename := path.Join(*dumpDir, name)
-		if err := ioutil.WriteFile(filename, entry.Cert.Data, 0644); err != nil {
+		if err := os.WriteFile(filename, entry.Cert.Data, 0644); err != nil {
 			log.Printf("Failed to dump data for %s at index %d: %v", prefix, entry.Index, err)
 		}
 	}
@@ -90,7 +91,7 @@ func dumpData(entry *ct.RawLogEntry) {
 	for ii := 0; ii < len(entry.Chain); ii++ {
 		name := fmt.Sprintf("%s-%014d-%02d.der", prefix, entry.Index, ii)
 		filename := path.Join(*dumpDir, name)
-		if err := ioutil.WriteFile(filename, entry.Chain[ii].Data, 0644); err != nil {
+		if err := os.WriteFile(filename, entry.Chain[ii].Data, 0644); err != nil {
 			log.Printf("Failed to dump data for CA at index %d: %v", entry.Index, err)
 		}
 	}
@@ -219,8 +220,12 @@ func main() {
 
 	ctx := context.Background()
 	if *printChains {
-		s.Scan(ctx, logFullChain, logFullChain)
+		if err := s.Scan(ctx, logFullChain, logFullChain); err != nil {
+			log.Fatal(err)
+		}
 	} else {
-		s.Scan(ctx, logCertInfo, logPrecertInfo)
+		if err := s.Scan(ctx, logCertInfo, logPrecertInfo); err != nil {
+			log.Fatal(err)
+		}
 	}
 }

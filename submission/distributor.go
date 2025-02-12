@@ -16,6 +16,7 @@ package submission
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -23,16 +24,22 @@ import (
 	"sync"
 	"time"
 
-	"github.com/golang/glog"
 	"github.com/google/certificate-transparency-go/client"
 	"github.com/google/certificate-transparency-go/ctpolicy"
 	"github.com/google/certificate-transparency-go/jsonclient"
-	"github.com/google/certificate-transparency-go/loglist2"
+	"github.com/google/certificate-transparency-go/loglist3"
 	"github.com/google/certificate-transparency-go/trillian/ctfe"
 	"github.com/google/certificate-transparency-go/x509"
+	"github.com/google/certificate-transparency-go/x509util"
 	"github.com/google/trillian/monitoring"
+	"k8s.io/klog/v2"
 
 	ct "github.com/google/certificate-transparency-go"
+)
+
+var (
+	ErrDistributorNotEnoughCompatibleLogs   = errors.New("distributor does not have enough compatible Logs to comply with the policy")
+	ErrDistributorUnableToProcessEmptyChain = errors.New("distributor unable to process empty chain")
 )
 
 var (
@@ -65,7 +72,7 @@ const (
 type pendingLogsPolicy struct {
 }
 
-func (stubP pendingLogsPolicy) LogsByGroup(cert *x509.Certificate, approved *loglist2.LogList) (ctpolicy.LogPolicyData, error) {
+func (stubP pendingLogsPolicy) LogsByGroup(cert *x509.Certificate, approved *loglist3.LogList) (ctpolicy.LogPolicyData, error) {
 	baseGroup, err := ctpolicy.BaseGroupFor(approved, 1)
 	groups := ctpolicy.LogPolicyData{baseGroup.Name: baseGroup}
 	return groups, err
@@ -77,21 +84,26 @@ func (stubP pendingLogsPolicy) Name() string {
 
 // Distributor operates policy-based submission across Logs.
 type Distributor struct {
-	ll                 *loglist2.LogList
-	usableLl           *loglist2.LogList
-	pendingQualifiedLl *loglist2.LogList
+	ll                 *loglist3.LogList
+	usableLl           *loglist3.LogList
+	pendingQualifiedLl *loglist3.LogList
 
 	mu sync.RWMutex
 
 	// helper structs produced out of ll during init.
 	logClients map[string]client.AddLogClient
-	logRoots   loglist2.LogRoots
-	rootPool   *ctfe.PEMCertPool
+	logRoots   loglist3.LogRoots
+	rootPool   *x509util.PEMCertPool
 
 	rootDataFull bool
 
 	policy            ctpolicy.CTPolicy
 	pendingLogsPolicy ctpolicy.CTPolicy
+
+	// rootCompatibilityCheckDisabled being set to true disables the root
+	// compatibility checking the distributor does before sending a
+	// certificate to a given CT log.
+	rootCompatibilityCheckDisabled bool
 }
 
 // RefreshRoots requests roots from Logs and updates local copy.
@@ -100,9 +112,12 @@ type Distributor struct {
 // If at least one root was successfully parsed for a log, log roots set gets
 // the update.
 func (d *Distributor) RefreshRoots(ctx context.Context) map[string]error {
+	if d.rootCompatibilityCheckDisabled {
+		return nil
+	}
 	type RootsResult struct {
 		LogURL string
-		Roots  *ctfe.PEMCertPool
+		Roots  *x509util.PEMCertPool
 		Err    error
 	}
 	ch := make(chan RootsResult, len(d.logClients))
@@ -120,7 +135,7 @@ func (d *Distributor) RefreshRoots(ctx context.Context) map[string]error {
 				ch <- res
 				return
 			}
-			res.Roots = ctfe.NewPEMCertPool()
+			res.Roots = x509util.NewPEMCertPool()
 			for _, r := range roots {
 				parsed, err := x509.ParseCertificate(r.Data)
 				if x509.IsFatal(err) {
@@ -139,7 +154,7 @@ func (d *Distributor) RefreshRoots(ctx context.Context) map[string]error {
 	}
 
 	// Collect get-roots results for every Log-client.
-	freshRoots := make(loglist2.LogRoots)
+	freshRoots := make(loglist3.LogRoots)
 	errors := make(map[string]error)
 	for range d.logClients {
 		r := <-ch
@@ -160,7 +175,7 @@ func (d *Distributor) RefreshRoots(ctx context.Context) map[string]error {
 	d.logRoots = freshRoots
 	d.rootDataFull = len(d.logRoots) == len(d.logClients)
 	// Merge individual root-pools into a unified one
-	d.rootPool = ctfe.NewPEMCertPool()
+	d.rootPool = x509util.NewPEMCertPool()
 	for _, pool := range d.logRoots {
 		for _, c := range pool.RawCertificates() {
 			d.rootPool.AddCert(c)
@@ -191,13 +206,13 @@ func incErrCounter(logURL string, endpoint string, rspErr error) {
 	err, ok := rspErr.(client.RspError)
 	switch {
 	case !ok:
-		glog.Errorf("unknown_error (%s, %s) => %v", logURL, endpoint, rspErr)
+		klog.Errorf("unknown_error (%s, %s) => %v", logURL, endpoint, rspErr)
 		errCounter.Inc(logURL, endpoint, "unknown_error")
 	case err.Err != nil && err.StatusCode == http.StatusOK:
-		glog.Errorf("invalid_sct (%s, %s) => HTTP details: status=%d, body:\n%s", logURL, endpoint, err.StatusCode, err.Body)
+		klog.Errorf("invalid_sct (%s, %s) => HTTP details: status=%d, body:\n%s", logURL, endpoint, err.StatusCode, err.Body)
 		errCounter.Inc(logURL, endpoint, "invalid_sct")
 	case err.Err != nil: // err.StatusCode != http.StatusOK.
-		glog.Errorf("connection_error (%s, %s) => HTTP details: status=%d, body:\n%s", logURL, endpoint, err.StatusCode, err.Body)
+		klog.Errorf("connection_error (%s, %s) => HTTP details: status=%d, body:\n%s", logURL, endpoint, err.StatusCode, err.Body)
 		errCounter.Inc(logURL, endpoint, "connection_error")
 	}
 }
@@ -246,11 +261,18 @@ func parseRawChain(rawChain [][]byte) ([]*x509.Certificate, error) {
 // on asPreChain param.
 func (d *Distributor) addSomeChain(ctx context.Context, rawChain [][]byte, loadPendingLogs bool, asPreChain bool) ([]*AssignedSCT, error) {
 	if len(rawChain) == 0 {
-		return nil, fmt.Errorf("distributor unable to process empty chain")
+		return nil, ErrDistributorUnableToProcessEmptyChain
 	}
 
 	// Helper function establishing responsibility of locking while determining log list and root chain.
-	compatibleLogsAndChain := func() (loglist2.LogList, []*x509.Certificate, error) {
+	compatibleLogsAndChain := func() (loglist3.LogList, []*x509.Certificate, error) {
+		parsedChain, err := parseRawChain(rawChain)
+		if err != nil {
+			return loglist3.LogList{}, nil, fmt.Errorf("distributor unable to parse cert-chain: %v", err)
+		}
+		if d.rootCompatibilityCheckDisabled {
+			return d.usableLl.Compatible(parsedChain[0], nil, loglist3.LogRoots{}), parsedChain, nil
+		}
 		d.mu.RLock()
 		defer d.mu.RUnlock()
 		vOpts := ctfe.NewCertValidationOpts(d.rootPool, time.Time{}, false, false, nil, nil, false, nil)
@@ -260,14 +282,10 @@ func (d *Distributor) addSomeChain(ctx context.Context, rawChain [][]byte, loadP
 		}
 		if d.rootDataFull {
 			// Could not verify the chain while root info for logs is complete.
-			return loglist2.LogList{}, nil, fmt.Errorf("distributor unable to process cert-chain: %v", err)
+			return loglist3.LogList{}, nil, fmt.Errorf("distributor unable to process cert-chain: %w", err)
 		}
 
 		// Chain might be rooted to the Log which has no root-info yet.
-		parsedChain, err := parseRawChain(rawChain)
-		if err != nil {
-			return loglist2.LogList{}, nil, fmt.Errorf("distributor unable to parse cert-chain: %v", err)
-		}
 		return d.usableLl.Compatible(parsedChain[0], nil, d.logRoots), parsedChain, nil
 	}
 	compatibleLogs, parsedChain, err := compatibleLogsAndChain()
@@ -294,7 +312,7 @@ func (d *Distributor) addSomeChain(ctx context.Context, rawChain [][]byte, loadP
 	// Set up policy structs.
 	groups, err := d.policy.LogsByGroup(parsedChain[0], &compatibleLogs)
 	if err != nil {
-		return nil, fmt.Errorf("distributor does not have enough compatible Logs to comply with the policy: %v", err)
+		return nil, fmt.Errorf("%w: %w", ErrDistributorNotEnoughCompatibleLogs, err)
 	}
 	chain := make([]ct.ASN1Cert, len(parsedChain))
 	for i, c := range parsedChain {
@@ -306,7 +324,9 @@ func (d *Distributor) addSomeChain(ctx context.Context, rawChain [][]byte, loadP
 			if err != nil {
 				return
 			}
-			GetSCTs(ctx, d, chain, asPreChain, pendingGroup)
+			if _, err := GetSCTs(ctx, d, chain, asPreChain, pendingGroup); err != nil {
+				klog.Errorf("GetSCTs(): %v", err)
+			}
 		}()
 	}
 	return GetSCTs(ctx, d, chain, asPreChain, groups)
@@ -327,10 +347,10 @@ func (d *Distributor) AddChain(ctx context.Context, rawChain [][]byte, loadPendi
 }
 
 // LogClientBuilder builds client-interface instance for a given Log.
-type LogClientBuilder func(*loglist2.Log) (client.AddLogClient, error)
+type LogClientBuilder func(*loglist3.Log) (client.AddLogClient, error)
 
 // BuildLogClient is default (non-mock) LogClientBuilder.
-func BuildLogClient(log *loglist2.Log) (client.AddLogClient, error) {
+func BuildLogClient(log *loglist3.Log) (client.AddLogClient, error) {
 	u, err := url.Parse(log.URL)
 	if err != nil {
 		return nil, err
@@ -346,40 +366,47 @@ func BuildLogClient(log *loglist2.Log) (client.AddLogClient, error) {
 // The Distributor will asynchronously fetch the latest roots from all of the
 // logs when active. Call Run() to fetch roots and init regular updates to keep
 // the local copy of the roots up-to-date.
-func NewDistributor(ll *loglist2.LogList, plc ctpolicy.CTPolicy, lcBuilder LogClientBuilder, mf monitoring.MetricFactory) (*Distributor, error) {
+func NewDistributor(ll *loglist3.LogList, plc ctpolicy.CTPolicy, lcBuilder LogClientBuilder, mf monitoring.MetricFactory, distributorOptions ...DistributorOption) (*Distributor, error) {
 	var d Distributor
 	// Divide Logs by statuses.
 	d.ll = ll
-	usableStat := []loglist2.LogStatus{loglist2.UsableLogStatus}
+	usableStat := []loglist3.LogStatus{loglist3.UsableLogStatus}
 	active := ll.SelectByStatus(usableStat)
 	d.usableLl = &active
-	pendingQualifiedStat := []loglist2.LogStatus{
-		loglist2.PendingLogStatus, loglist2.QualifiedLogStatus}
+	pendingQualifiedStat := []loglist3.LogStatus{
+		loglist3.PendingLogStatus, loglist3.QualifiedLogStatus}
 	pending := ll.SelectByStatus(pendingQualifiedStat)
 	d.pendingQualifiedLl = &pending
 
 	d.policy = plc
 	d.pendingLogsPolicy = pendingLogsPolicy{}
 	d.logClients = make(map[string]client.AddLogClient)
-	d.logRoots = make(loglist2.LogRoots)
-	d.rootPool = ctfe.NewPEMCertPool()
+	d.logRoots = make(loglist3.LogRoots)
+	d.rootPool = x509util.NewPEMCertPool()
 
 	// Build clients for each of the Logs. Also build log-to-id map.
 	if err := d.buildLogClients(lcBuilder, d.usableLl); err != nil {
 		return nil, err
 	}
-	d.buildLogClients(lcBuilder, d.pendingQualifiedLl)
+	if err := d.buildLogClients(lcBuilder, d.pendingQualifiedLl); err != nil {
+		return nil, err
+	}
 
 	if mf == nil {
 		mf = monitoring.InertMetricFactory{}
 	}
 	distOnce.Do(func() { distInitMetrics(mf) })
+	for _, option := range distributorOptions {
+		if err := option.Apply(&d); err != nil {
+			return nil, fmt.Errorf("unable to apply distributor option %v: %w", option, err)
+		}
+	}
 	return &d, nil
 }
 
 // buildLogClients builds clients for every Log provided and adds them into
 // Distributor internals.
-func (d *Distributor) buildLogClients(lcBuilder LogClientBuilder, ll *loglist2.LogList) error {
+func (d *Distributor) buildLogClients(lcBuilder LogClientBuilder, ll *loglist3.LogList) error {
 	for _, op := range ll.Operators {
 		for _, log := range op.Logs {
 			lc, err := lcBuilder(log)
@@ -389,5 +416,20 @@ func (d *Distributor) buildLogClients(lcBuilder LogClientBuilder, ll *loglist2.L
 			d.logClients[log.URL] = lc
 		}
 	}
+	return nil
+}
+
+// DistributorOption allows the setting of internal behavior on the distributor.
+type DistributorOption interface {
+	// Apply applies a change to the distributor.
+	Apply(d *Distributor) error
+}
+
+// DisableRootCompatibilityCheckingDistributorOption disables the root compatibility
+// checking that the distributor does before submitting a certificate to CT logs.
+type DisableRootCompatibilityCheckingDistributorOption struct{}
+
+func (DisableRootCompatibilityCheckingDistributorOption) Apply(d *Distributor) error {
+	d.rootCompatibilityCheckDisabled = true
 	return nil
 }

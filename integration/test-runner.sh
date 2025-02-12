@@ -3,9 +3,8 @@
 # This script is used by the CloudBuild ct_testbase docker image.
 # It's executed as the default command by that image in order to run a
 # full presubmit/integration test.
-# It's equivalent to the "script:" section in the travis config.
 
-./scripts/presubmit.sh ${PRESUBMIT_OPTS}
+./scripts/presubmit.sh ${PRESUBMIT_OPTS} || exit 1
 
 # Check re-generation didn't change anything
 status=$(git status --porcelain | egrep -v 'coverage|go\.(mod|sum)') || :

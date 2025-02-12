@@ -19,7 +19,6 @@ readonly CT_GO_PATH=$(go list -f '{{.Dir}}' github.com/google/certificate-transp
 #  - CT_SERVER_PIDS     : bash array of CT HTTP server pids
 # in addition to the variables populated by log_prep_test.
 # If etcd and Prometheus are configured, it also populates:
-#  - ETCDISCOVER_PID   : pid of etcd service watcher
 #  - PROMETHEUS_PID    : pid of local Prometheus server
 #  - PROMETHEUS_CFGDIR : Prometheus configuration directory
 ct_prep_test() {
@@ -62,20 +61,8 @@ ct_prep_test() {
   if [[ -x "${PROMETHEUS_DIR}/prometheus" ]]; then
     if [[ ! -z "${ETCD_OPTS}" ]]; then
         PROMETHEUS_CFGDIR="$(mktemp -d ${TMPDIR}/ct-prometheus-XXXXXX)"
-        local prom_cfg="${PROMETHEUS_CFGDIR}/config.yaml"
-        local etcdiscovered="${PROMETHEUS_CFGDIR}/trillian.json"
-        sed "s!@ETCDISCOVERED@!${etcdiscovered}!" ${CT_GO_PATH}/trillian/integration/prometheus.yml > "${prom_cfg}"
-        echo "Prometheus configuration in ${prom_cfg}:"
-        cat ${prom_cfg}
-
-        echo "Building etcdiscover"
-        go build github.com/google/trillian/monitoring/prometheus/etcdiscover
-
-        echo "Launching etcd service monitor updating ${etcdiscovered}"
-        ./etcdiscover ${ETCD_OPTS} --etcd_services=trillian-ctfe-metrics-http,trillian-logserver-http,trillian-logsigner-http -target=${etcdiscovered} --logtostderr &
-        ETCDISCOVER_PID=$!
         echo "Launching Prometheus (default location localhost:9090)"
-        ${PROMETHEUS_DIR}/prometheus --config.file=${prom_cfg} \
+        ${PROMETHEUS_DIR}/prometheus --config.file=${CT_GO_PATH}/trillian/integration/prometheus.yml \
                            --web.console.templates=${CT_GO_PATH}/trillian/integration/consoles \
                            --web.console.libraries=${CT_GO_PATH}/third_party/prometheus/console_libs &
         PROMETHEUS_PID=$!
@@ -95,10 +82,10 @@ ct_provision() {
 
   # Build config files with absolute paths
   CT_CFG=$(mktemp ${TMPDIR}/ct-XXXXXX)
-  sed "s!@TESTDATA@!${CT_GO_PATH}/trillian/testdata!" ${CT_GO_PATH}/trillian/integration/ct_integration_test.cfg > "${CT_CFG}"
+  sed "s!@TESTDATA@!${CT_GO_PATH}/trillian/testdata!" ${CT_GO_PATH}/trillian/integration${CONFIG_SUBDIR}/ct_integration_test.cfg > "${CT_CFG}"
 
   CT_LIFECYCLE_CFG=$(mktemp ${TMPDIR}/ct-XXXXXX)
-  sed "s!@TESTDATA@!${CT_GO_PATH}/trillian/testdata!" ${CT_GO_PATH}/trillian/integration/ct_lifecycle_test.cfg > "${CT_LIFECYCLE_CFG}"
+  sed "s!@TESTDATA@!${CT_GO_PATH}/trillian/testdata!" ${CT_GO_PATH}/trillian/integration${CONFIG_SUBDIR}/ct_lifecycle_test.cfg > "${CT_LIFECYCLE_CFG}"
 
   echo 'Building createtree'
   go build github.com/google/trillian/cmd/createtree/
@@ -113,7 +100,7 @@ ct_provision() {
 
   echo "CT Integration Configuration in ${CT_CFG}:"
   cat "${CT_CFG}"
-  echo "CT Lifeycle Configuration in ${CT_LIFECYCLE_CFG}:"
+  echo "CT Lifecycle Configuration in ${CT_LIFECYCLE_CFG}:"
   cat "${CT_LIFECYCLE_CFG}"
   echo
 }
@@ -143,9 +130,6 @@ ct_stop_test() {
   local pids
   if [[ "${PROMETHEUS_PID}" != "" ]]; then
     pids+=" ${PROMETHEUS_PID}"
-  fi
-  if [[ "${ETCDISCOVER_PID}" != "" ]]; then
-    pids+=" ${ETCDISCOVER_PID}"
   fi
   echo "Stopping CT HTTP servers (pids ${CT_SERVER_PIDS[@]})"
   pids+=" ${CT_SERVER_PIDS[@]}"

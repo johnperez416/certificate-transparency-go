@@ -17,18 +17,19 @@ package impl
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/http"
 
-	"github.com/golang/glog"
 	ct "github.com/google/certificate-transparency-go"
-	"github.com/google/certificate-transparency-go/internal/witness/api"
 	ih "github.com/google/certificate-transparency-go/internal/witness/cmd/witness/internal/http"
 	"github.com/google/certificate-transparency-go/internal/witness/cmd/witness/internal/witness"
 	"github.com/gorilla/mux"
 	_ "github.com/mattn/go-sqlite3" // Load drivers for sqlite3
+	"k8s.io/klog/v2"
 )
 
 // LogConfig contains a list of LogInfo (configuration options for a log).
@@ -66,8 +67,8 @@ func buildLogMap(config LogConfig) (map[string]ct.SignatureVerifier, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to create signature verifier: %v", err)
 		}
-		// And then to create the (alphanumeric) logID.
-		logID, err := api.LogIDFromPubKey(log.PubKey)
+		// And then to create the logID.
+		logID, err := LogIDFromPubKey(log.PubKey)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create log id: %v", err)
 		}
@@ -76,17 +77,31 @@ func buildLogMap(config LogConfig) (map[string]ct.SignatureVerifier, error) {
 	return logMap, nil
 }
 
+// LogIDFromPubKey builds the logID given the base64-encoded public key.
+func LogIDFromPubKey(pk string) (string, error) {
+	der, err := base64.StdEncoding.DecodeString(pk)
+	if err != nil {
+		return "", fmt.Errorf("failed to decode public key: %v", err)
+	}
+	sha := sha256.Sum256(der)
+	return base64.StdEncoding.EncodeToString(sha[:]), nil
+}
+
 // Main sets up and runs the witness given the options.
 func Main(ctx context.Context, opts ServerOpts) error {
 	if len(opts.DBFile) == 0 {
 		return errors.New("DBFile is required")
 	}
 	// Start up local database.
-	glog.Infof("Connecting to local DB at %q", opts.DBFile)
+	klog.Infof("Connecting to local DB at %q", opts.DBFile)
 	db, err := sql.Open("sqlite3", opts.DBFile)
 	if err != nil {
 		return fmt.Errorf("failed to connect to DB: %w", err)
 	}
+
+	// Avoid multiple writes colliding and resulting in a "database locked" error.
+	db.SetMaxOpenConns(1)
+
 	// Load log configuration into the map.
 	logMap, err := buildLogMap(opts.Config)
 	if err != nil {
@@ -102,9 +117,11 @@ func Main(ctx context.Context, opts ServerOpts) error {
 		return fmt.Errorf("error creating witness: %v", err)
 	}
 
-	glog.Infof("Starting witness server...")
+	klog.Infof("Starting witness server...")
 	srv := ih.NewServer(w)
-	r := mux.NewRouter()
+	// These options are required as some logID values contain forward
+	// slashes, and will be PathUnescape-d later.
+	r := mux.NewRouter().UseEncodedPath()
 	srv.RegisterHandlers(r)
 	hServer := &http.Server{
 		Addr:    opts.ListenAddr,
@@ -116,7 +133,9 @@ func Main(ctx context.Context, opts ServerOpts) error {
 		close(e)
 	}()
 	<-ctx.Done()
-	glog.Info("Server shutting down")
-	hServer.Shutdown(ctx)
+	klog.Info("Server shutting down")
+	if err := hServer.Shutdown(ctx); err != nil {
+		klog.Errorf("Shutdown(): %v", err)
+	}
 	return <-e
 }

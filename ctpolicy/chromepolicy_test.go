@@ -4,7 +4,7 @@
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//	http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -83,7 +83,6 @@ func wantedGroups(goog int, nonGoog int, base int, minusBob bool) LogPolicyData 
 	}
 	return gi
 }
-
 func TestCheckChromePolicy(t *testing.T) {
 	tests := []struct {
 		name string
@@ -114,7 +113,6 @@ func TestCheckChromePolicy(t *testing.T) {
 
 	var policy ChromeCTPolicy
 	sampleLogList := sampleLogList(t)
-
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			got, err := policy.LogsByGroup(test.cert, sampleLogList)

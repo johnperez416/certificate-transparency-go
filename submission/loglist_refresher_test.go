@@ -17,7 +17,7 @@ package submission
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
+	"log"
 	"net/http"
 	"os"
 	"regexp"
@@ -25,7 +25,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/certificate-transparency-go/loglist2"
+	"github.com/google/certificate-transparency-go/loglist3"
 	"github.com/google/certificate-transparency-go/schedule"
 	"github.com/google/go-cmp/cmp"
 )
@@ -33,15 +33,16 @@ import (
 // createTempFile creates a file in the system's temp directory and writes data to it.
 // It returns the name of the file.
 func createTempFile(data string) (string, error) {
-	f, err := ioutil.TempFile("", "")
+	f, err := os.CreateTemp("", "")
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
+	defer func() {
+		if err := f.Close(); err != nil {
+			log.Fatalf("Operation to close file failed: %v", err)
+		}
+	}()
 	if _, err := f.WriteString(data); err != nil {
-		return "", err
-	}
-	if err := f.Close(); err != nil {
 		return "", err
 	}
 	return f.Name(), nil
@@ -55,7 +56,11 @@ func ExampleLogListRefresher() {
 	if err != nil {
 		panic(err)
 	}
-	defer os.Remove(f)
+	defer func() {
+		if err := os.Remove(f); err != nil {
+			log.Fatalf("Operation to remove temp file failed: %v", err)
+		}
+	}()
 
 	llr := NewLogListRefresher(f)
 
@@ -117,13 +122,13 @@ func TestNewLogListRefresher(t *testing.T) {
 	testCases := []struct {
 		name      string
 		ll        string
-		wantLl    *loglist2.LogList
+		wantLl    *loglist3.LogList
 		errRegexp *regexp.Regexp
 	}{
 		{
 			name:   "SuccessfulRead",
 			ll:     `{"operators": [{"id":0,"name":"Google"}]}`,
-			wantLl: &loglist2.LogList{Operators: []*loglist2.Operator{{Name: "Google"}}},
+			wantLl: &loglist3.LogList{Operators: []*loglist3.Operator{{Name: "Google"}}},
 		},
 		{
 			name:      "CannotParseInput",
@@ -138,7 +143,11 @@ func TestNewLogListRefresher(t *testing.T) {
 			if err != nil {
 				t.Fatalf("createTempFile(%q) = (_, %q), want (_, nil)", tc.ll, err)
 			}
-			defer os.Remove(f)
+			defer func() {
+				if err := os.Remove(f); err != nil {
+					t.Fatalf("Operation to remove temp file failed: %v", err)
+				}
+			}()
 
 			beforeRefresh := time.Now()
 			llr := NewLogListRefresher(f)
@@ -173,7 +182,7 @@ func TestNewLogListRefresherUpdate(t *testing.T) {
 		name      string
 		ll        string
 		llNext    string
-		wantLl    *loglist2.LogList
+		wantLl    *loglist3.LogList
 		errRegexp *regexp.Regexp
 	}{
 		{
@@ -187,7 +196,7 @@ func TestNewLogListRefresherUpdate(t *testing.T) {
 			name:      "LogListUpdated",
 			ll:        `{"operators": [{"id":0,"name":"Google"}]}`,
 			llNext:    `{"operators": [{"id":0,"name":"GoogleOps"}]}`,
-			wantLl:    &loglist2.LogList{Operators: []*loglist2.Operator{{Name: "GoogleOps"}}},
+			wantLl:    &loglist3.LogList{Operators: []*loglist3.Operator{{Name: "GoogleOps"}}},
 			errRegexp: nil,
 		},
 		{
@@ -204,7 +213,11 @@ func TestNewLogListRefresherUpdate(t *testing.T) {
 			if err != nil {
 				t.Fatalf("createTempFile(%q) = (_, %q), want (_, nil)", tc.ll, err)
 			}
-			defer os.Remove(f)
+			defer func() {
+				if err := os.Remove(f); err != nil {
+					t.Fatalf("Operation to remove temp file failed: %v", err)
+				}
+			}()
 
 			llr := NewLogListRefresher(f)
 			if _, err := llr.Refresh(); err != nil {
@@ -212,8 +225,8 @@ func TestNewLogListRefresherUpdate(t *testing.T) {
 			}
 
 			// Simulate Log list update.
-			if err := ioutil.WriteFile(f, []byte(tc.llNext), 0755); err != nil {
-				t.Fatalf("ioutil.WriteFile(%q, %q) = %q, want nil", f, tc.llNext, err)
+			if err := os.WriteFile(f, []byte(tc.llNext), 0755); err != nil {
+				t.Fatalf("os.WriteFile(%q, %q) = %q, want nil", f, tc.llNext, err)
 			}
 
 			beforeRefresh := time.Now()

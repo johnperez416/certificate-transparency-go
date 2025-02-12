@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/golang/glog"
 	ct "github.com/google/certificate-transparency-go"
 	"github.com/google/certificate-transparency-go/scanner"
 	"github.com/google/certificate-transparency-go/trillian/migrillian/configpb"
@@ -32,6 +31,7 @@ import (
 	"github.com/google/trillian/types"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"k8s.io/klog/v2"
 )
 
 var errRetry = errors.New("retry")
@@ -115,13 +115,13 @@ func (c *PreorderedLogClient) addSequencedLeaves(ctx context.Context, b *scanner
 	}
 
 	var err error
-	bo.Retry(ctx, func() error {
+	boerr := bo.Retry(ctx, func() error {
 		var rsp *trillian.AddSequencedLeavesResponse
 		rsp, err = c.cli.AddSequencedLeaves(ctx, &req)
 		switch status.Code(err) {
 		case codes.ResourceExhausted: // There was (probably) a quota error.
 			end := b.Start + int64(len(b.Entries))
-			glog.Errorf("%d: retrying batch [%d, %d) due to error: %v", c.treeID, b.Start, end, err)
+			klog.Errorf("%d: retrying batch [%d, %d) due to error: %v", c.treeID, b.Start, end, err)
 			return errRetry
 		case codes.OK:
 			if rsp == nil {
@@ -133,8 +133,12 @@ func (c *PreorderedLogClient) addSequencedLeaves(ctx context.Context, b *scanner
 			return nil // Stop backing off, and return err as is below.
 		}
 	})
-
-	return err
+	if err != nil {
+		// Return the more specific error if available
+		return err
+	}
+	// Return the timeout, or nil on success
+	return boerr
 }
 
 func (c *PreorderedLogClient) buildLogLeaf(index int64, entry *ct.LeafEntry) (*trillian.LogLeaf, error) {
@@ -146,9 +150,9 @@ func (c *PreorderedLogClient) buildLogLeaf(index int64, entry *ct.LeafEntry) (*t
 	// Don't return on x509 parsing errors because we want to migrate this log
 	// entry as is. But log the error so that it can be flagged by monitoring.
 	if _, err = rle.ToLogEntry(); x509.IsFatal(err) {
-		glog.Errorf("%s: index=%d: x509 fatal error: %v", c.prefix, index, err)
+		klog.Errorf("%s: index=%d: x509 fatal error: %v", c.prefix, index, err)
 	} else if err != nil {
-		glog.Infof("%s: index=%d: x509 non-fatal error: %v", c.prefix, index, err)
+		klog.Infof("%s: index=%d: x509 non-fatal error: %v", c.prefix, index, err)
 	}
 	// TODO(pavelkalinnikov): Verify cert chain if error is nil or non-fatal.
 

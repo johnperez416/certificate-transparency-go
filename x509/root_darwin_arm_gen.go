@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build ignore
 // +build ignore
 
 // Generates root_darwin_armx.go.
@@ -24,9 +25,10 @@ import (
 	"flag"
 	"fmt"
 	"go/format"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
+	"os"
 	"os/exec"
 	"regexp"
 	"strings"
@@ -63,7 +65,7 @@ func main() {
 	if err != nil {
 		log.Fatal("source format error:", err)
 	}
-	if err := ioutil.WriteFile(*output, source, 0644); err != nil {
+	if err := os.WriteFile(*output, source, 0644); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -132,7 +134,7 @@ func fetchCertIDs() ([]certID, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}

@@ -23,30 +23,32 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/golang/glog"
 	"github.com/google/certificate-transparency-go/asn1"
 	"github.com/google/certificate-transparency-go/tls"
 	"github.com/google/certificate-transparency-go/trillian/util"
 	"github.com/google/certificate-transparency-go/x509"
+	"github.com/google/certificate-transparency-go/x509util"
 	"github.com/google/trillian"
 	"github.com/google/trillian/monitoring"
 	"github.com/google/trillian/types"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/prototext"
+	"k8s.io/klog/v2"
 
 	ct "github.com/google/certificate-transparency-go"
 )
 
 var (
-	alignGetEntries = flag.Bool("align_getentries", true, "Enable get-entries request alignment")
+	alignGetEntries   = flag.Bool("align_getentries", true, "Enable get-entries request alignment")
+	getEntriesMetrics = flag.Bool("getentries_metrics", false, "Export get-entries distribution metrics")
 )
 
 const (
@@ -105,19 +107,20 @@ const (
 var (
 	// Metrics are all per-log (label "logid"), but may also be
 	// per-entrypoint (label "ep") or per-return-code (label "rc").
-	once               sync.Once
-	knownLogs          monitoring.Gauge     // logid => value (always 1.0)
-	isMirrorLog        monitoring.Gauge     // logid => value (either 0.0 or 1.0)
-	maxMergeDelay      monitoring.Gauge     // logid => value
-	expMergeDelay      monitoring.Gauge     // logid => value
-	lastSCTTimestamp   monitoring.Gauge     // logid => value
-	lastSTHTimestamp   monitoring.Gauge     // logid => value
-	lastSTHTreeSize    monitoring.Gauge     // logid => value
-	frozenSTHTimestamp monitoring.Gauge     // logid => value
-	reqsCounter        monitoring.Counter   // logid, ep => value
-	rspsCounter        monitoring.Counter   // logid, ep, rc => value
-	rspLatency         monitoring.Histogram // logid, ep, rc => value
-	alignedGetEntries  monitoring.Counter   // logid, aligned => count
+	once                       sync.Once
+	knownLogs                  monitoring.Gauge     // logid => value (always 1.0)
+	isMirrorLog                monitoring.Gauge     // logid => value (either 0.0 or 1.0)
+	maxMergeDelay              monitoring.Gauge     // logid => value
+	expMergeDelay              monitoring.Gauge     // logid => value
+	lastSCTTimestamp           monitoring.Gauge     // logid => value
+	lastSTHTimestamp           monitoring.Gauge     // logid => value
+	lastSTHTreeSize            monitoring.Gauge     // logid => value
+	frozenSTHTimestamp         monitoring.Gauge     // logid => value
+	reqsCounter                monitoring.Counter   // logid, ep => value
+	rspsCounter                monitoring.Counter   // logid, ep, rc => value
+	rspLatency                 monitoring.Histogram // logid, ep, rc => value
+	alignedGetEntries          monitoring.Counter   // logid, aligned => count
+	getEntriesStartPercentiles monitoring.Histogram // logid => percentile
 )
 
 // setupMetrics initializes all the exported metrics.
@@ -134,6 +137,12 @@ func setupMetrics(mf monitoring.MetricFactory) {
 	rspsCounter = mf.NewCounter("http_rsps", "Number of responses", "logid", "ep", "rc")
 	rspLatency = mf.NewHistogram("http_latency", "Latency of responses in seconds", "logid", "ep", "rc")
 	alignedGetEntries = mf.NewCounter("aligned_get_entries", "Number of get-entries requests which were aligned to size limit boundaries", "logid", "aligned")
+	getEntriesStartPercentiles = mf.NewHistogramWithBuckets(
+		"get_leaves_start_percentiles",
+		"Start index of GetLeavesByRange request using percentage of current log size at the time",
+		monitoring.PercentileBuckets(5),
+		"logid",
+	)
 }
 
 // Entrypoints is a list of entrypoint names as exposed in statistics/logging.
@@ -165,9 +174,9 @@ func (a AppHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		latency := a.Info.TimeSource.Now().Sub(startTime).Seconds()
 		rspLatency.Observe(latency, label0, label1, strconv.Itoa(statusCode))
 	}()
-	glog.V(2).Infof("%s: request %v %q => %s", a.Info.LogPrefix, r.Method, r.URL, a.Name)
+	klog.V(2).Infof("%s: request %v %q => %s", a.Info.LogPrefix, r.Method, r.URL, a.Name)
 	if r.Method != a.Method {
-		glog.Warningf("%s: %s wrong HTTP method: %v", a.Info.LogPrefix, a.Name, r.Method)
+		klog.Warningf("%s: %s wrong HTTP method: %v", a.Info.LogPrefix, a.Name, r.Method)
 		a.Info.SendHTTPError(w, http.StatusMethodNotAllowed, fmt.Errorf("method not allowed: %s", r.Method))
 		a.Info.RequestLog.Status(logCtx, http.StatusMethodNotAllowed)
 		return
@@ -191,17 +200,17 @@ func (a AppHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var err error
 	statusCode, err = a.Handler(ctx, a.Info, w, r)
 	a.Info.RequestLog.Status(ctx, statusCode)
-	glog.V(2).Infof("%s: %s <= st=%d", a.Info.LogPrefix, a.Name, statusCode)
+	klog.V(2).Infof("%s: %s <= st=%d", a.Info.LogPrefix, a.Name, statusCode)
 	rspsCounter.Inc(label0, label1, strconv.Itoa(statusCode))
 	if err != nil {
-		glog.Warningf("%s: %s handler error: %v", a.Info.LogPrefix, a.Name, err)
+		klog.Warningf("%s: %s handler error: %v", a.Info.LogPrefix, a.Name, err)
 		a.Info.SendHTTPError(w, statusCode, err)
 		return
 	}
 
 	// Additional check, for consistency the handler must return an error for non-200 st
 	if statusCode != http.StatusOK {
-		glog.Warningf("%s: %s handler non 200 without error: %d %v", a.Info.LogPrefix, a.Name, statusCode, err)
+		klog.Warningf("%s: %s handler non 200 without error: %d %v", a.Info.LogPrefix, a.Name, statusCode, err)
 		a.Info.SendHTTPError(w, http.StatusInternalServerError, fmt.Errorf("http handler misbehaved, st: %d", statusCode))
 		return
 	}
@@ -210,7 +219,7 @@ func (a AppHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // CertValidationOpts contains various parameters for certificate chain validation
 type CertValidationOpts struct {
 	// trustedRoots is a pool of certificates that defines the roots the CT log will accept
-	trustedRoots *PEMCertPool
+	trustedRoots *x509util.PEMCertPool
 	// currentTime is the time used for checking a certificate's validity period
 	// against. If it's zero then time.Now() is used. Only for testing.
 	currentTime time.Time
@@ -234,7 +243,7 @@ type CertValidationOpts struct {
 }
 
 // NewCertValidationOpts builds validation options based on parameters.
-func NewCertValidationOpts(trustedRoots *PEMCertPool, currentTime time.Time, rejectExpired bool, rejectUnexpired bool, notAfterStart *time.Time, notAfterLimit *time.Time, acceptOnlyCA bool, extKeyUsages []x509.ExtKeyUsage) CertValidationOpts {
+func NewCertValidationOpts(trustedRoots *x509util.PEMCertPool, currentTime time.Time, rejectExpired bool, rejectUnexpired bool, notAfterStart *time.Time, notAfterLimit *time.Time, acceptOnlyCA bool, extKeyUsages []x509.ExtKeyUsage) CertValidationOpts {
 	var vOpts CertValidationOpts
 	vOpts.trustedRoots = trustedRoots
 	vOpts.currentTime = currentTime
@@ -245,6 +254,11 @@ func NewCertValidationOpts(trustedRoots *PEMCertPool, currentTime time.Time, rej
 	vOpts.acceptOnlyCA = acceptOnlyCA
 	vOpts.extKeyUsages = extKeyUsages
 	return vOpts
+}
+
+type leafChainBuilder interface {
+	BuildLogLeaf(ctx context.Context, chain []*x509.Certificate, logPrefix string, merkleLeaf *ct.MerkleTreeLeaf, isPrecert bool) (*trillian.LogLeaf, error)
+	FixLogLeaf(ctx context.Context, leaf *trillian.LogLeaf) error
 }
 
 // logInfo holds information for a specific log instance.
@@ -269,6 +283,8 @@ type logInfo struct {
 	signer crypto.Signer
 	// sthGetter provides STHs for the log
 	sthGetter STHGetter
+	// issuanceChainService provides the issuance chain add and get operations
+	issuanceChainService leafChainBuilder
 }
 
 // newLogInfo creates a new instance of logInfo.
@@ -277,6 +293,7 @@ func newLogInfo(
 	validationOpts CertValidationOpts,
 	signer crypto.Signer,
 	timeSource util.TimeSource,
+	issuanceChainService leafChainBuilder,
 ) *logInfo {
 	vCfg := instanceOpts.Validated
 	cfg := vCfg.Config
@@ -315,9 +332,13 @@ func newLogInfo(
 
 	if cfg.IsMirror {
 		isMirrorLog.Set(1.0, label)
+	} else {
+		isMirrorLog.Set(0.0, label)
 	}
 	maxMergeDelay.Set(float64(cfg.MaxMergeDelaySec), label)
 	expMergeDelay.Set(float64(cfg.ExpectedMergeDelaySec), label)
+
+	li.issuanceChainService = issuanceChainService
 
 	return li
 }
@@ -341,8 +362,8 @@ func (li *logInfo) Handlers(prefix string) PathHandlers {
 		prefix + ct.GetRootsPath:          AppHandler{Info: li, Handler: getRoots, Name: GetRootsName, Method: http.MethodGet},
 		prefix + ct.GetEntryAndProofPath:  AppHandler{Info: li, Handler: getEntryAndProof, Name: GetEntryAndProofName, Method: http.MethodGet},
 	}
-	// Remove endpoints not provided by mirrors.
-	if li.instanceOpts.Validated.Config.IsMirror {
+	// Remove endpoints not provided by readonly logs and mirrors.
+	if li.instanceOpts.Validated.Config.IsReadonly || li.instanceOpts.Validated.Config.IsMirror {
 		delete(ph, prefix+ct.AddChainPath)
 		delete(ph, prefix+ct.AddPreChainPath)
 	}
@@ -372,23 +393,27 @@ func (li *logInfo) getSTH(ctx context.Context) (*ct.SignedTreeHead, error) {
 	return sth, nil
 }
 
+func (li *logInfo) buildLeaf(ctx context.Context, chain []*x509.Certificate, merkleLeaf *ct.MerkleTreeLeaf, isPrecert bool) (*trillian.LogLeaf, error) {
+	return li.issuanceChainService.BuildLogLeaf(ctx, chain, li.LogPrefix, merkleLeaf, isPrecert)
+}
+
 // ParseBodyAsJSONChain tries to extract cert-chain out of request.
 func ParseBodyAsJSONChain(r *http.Request) (ct.AddChainRequest, error) {
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		glog.V(1).Infof("Failed to read request body: %v", err)
+		klog.V(1).Infof("Failed to read request body: %v", err)
 		return ct.AddChainRequest{}, err
 	}
 
 	var req ct.AddChainRequest
 	if err := json.Unmarshal(body, &req); err != nil {
-		glog.V(1).Infof("Failed to parse request body: %v", err)
+		klog.V(1).Infof("Failed to parse request body: %v", err)
 		return ct.AddChainRequest{}, err
 	}
 
 	// The cert chain is not allowed to be empty. We'll defer other validation for later
 	if len(req.Chain) == 0 {
-		glog.V(1).Infof("Request chain is empty: %s", body)
+		klog.V(1).Infof("Request chain is empty: %q", body)
 		return ct.AddChainRequest{}, errors.New("cert chain was empty")
 	}
 
@@ -454,15 +479,15 @@ func addChainInternal(ctx context.Context, li *logInfo, w http.ResponseWriter, r
 	if err != nil {
 		return http.StatusBadRequest, fmt.Errorf("failed to build MerkleTreeLeaf: %s", err)
 	}
-	leaf, err := buildLogLeafForAddChain(li, *merkleLeaf, chain, isPrecert)
+	leaf, err := li.buildLeaf(ctx, chain, merkleLeaf, isPrecert)
 	if err != nil {
-		return http.StatusInternalServerError, fmt.Errorf("failed to build LogLeaf: %s", err)
+		return http.StatusInternalServerError, err
 	}
 
 	// Send the Merkle tree leaf on to the Log server.
 	req := trillian.QueueLeafRequest{
 		LogId:    li.logID,
-		Leaf:     &leaf,
+		Leaf:     leaf,
 		ChargeTo: li.chargeUser(r),
 	}
 	if li.instanceOpts.CertificateQuotaUser != nil {
@@ -472,9 +497,9 @@ func addChainInternal(ctx context.Context, li *logInfo, w http.ResponseWriter, r
 		}
 	}
 
-	glog.V(2).Infof("%s: %s => grpc.QueueLeaves", li.LogPrefix, method)
+	klog.V(2).Infof("%s: %s => grpc.QueueLeaves", li.LogPrefix, method)
 	rsp, err := li.rpcClient.QueueLeaf(ctx, &req)
-	glog.V(2).Infof("%s: %s <= grpc.QueueLeaves err=%v", li.LogPrefix, method, err)
+	klog.V(2).Infof("%s: %s <= grpc.QueueLeaves err=%v", li.LogPrefix, method, err)
 	if err != nil {
 		return li.toHTTPStatus(err), fmt.Errorf("backend QueueLeaves request failed: %s", err)
 	}
@@ -510,7 +535,7 @@ func addChainInternal(ctx context.Context, li *logInfo, w http.ResponseWriter, r
 		// reason is logged and http status is already set
 		return http.StatusInternalServerError, fmt.Errorf("failed to write response: %s", err)
 	}
-	glog.V(3).Infof("%s: %s <= SCT", li.LogPrefix, method)
+	klog.V(3).Infof("%s: %s <= SCT", li.LogPrefix, method)
 	if sct.Timestamp == timeMillis {
 		lastSCTTimestamp.Set(float64(sct.Timestamp), strconv.FormatInt(li.logID, 10))
 	}
@@ -587,9 +612,9 @@ func getSTHConsistency(ctx context.Context, li *logInfo, w http.ResponseWriter, 
 			ChargeTo:       li.chargeUser(r),
 		}
 
-		glog.V(2).Infof("%s: GetSTHConsistency(%d, %d) => grpc.GetConsistencyProof %+v", li.LogPrefix, first, second, prototext.Format(&req))
+		klog.V(2).Infof("%s: GetSTHConsistency(%d, %d) => grpc.GetConsistencyProof %+v", li.LogPrefix, first, second, prototext.Format(&req))
 		rsp, err := li.rpcClient.GetConsistencyProof(ctx, &req)
-		glog.V(2).Infof("%s: GetSTHConsistency <= grpc.GetConsistencyProof err=%v", li.LogPrefix, err)
+		klog.V(2).Infof("%s: GetSTHConsistency <= grpc.GetConsistencyProof err=%v", li.LogPrefix, err)
 		if err != nil {
 			return li.toHTTPStatus(err), fmt.Errorf("backend GetConsistencyProof request failed: %s", err)
 		}
@@ -614,7 +639,7 @@ func getSTHConsistency(ctx context.Context, li *logInfo, w http.ResponseWriter, 
 			jsonRsp.Consistency = emptyProof
 		}
 	} else {
-		glog.V(2).Infof("%s: GetSTHConsistency(%d, %d) starts from 0 so return empty proof", li.LogPrefix, first, second)
+		klog.V(2).Infof("%s: GetSTHConsistency(%d, %d) starts from 0 so return empty proof", li.LogPrefix, first, second)
 		jsonRsp.Consistency = emptyProof
 	}
 
@@ -701,7 +726,7 @@ func getProofByHash(ctx context.Context, li *logInfo, w http.ResponseWriter, r *
 	w.Header().Set(contentTypeHeader, contentTypeJSON)
 	jsonData, err := json.Marshal(&proofRsp)
 	if err != nil {
-		glog.Warningf("%s: Failed to marshal get-proof-by-hash resp: %v", li.LogPrefix, proofRsp)
+		klog.Warningf("%s: Failed to marshal get-proof-by-hash resp: %v", li.LogPrefix, proofRsp)
 		return http.StatusInternalServerError, fmt.Errorf("failed to marshal get-proof-by-hash resp: %s", err)
 	}
 
@@ -734,10 +759,11 @@ func getEntries(ctx context.Context, li *logInfo, w http.ResponseWriter, r *http
 		Count:      count,
 		ChargeTo:   li.chargeUser(r),
 	}
-	rsp, err := li.rpcClient.GetLeavesByRange(ctx, &req)
+	rsp, httpStatus, err := rpcGetLeavesByRange(ctx, li, &req)
 	if err != nil {
-		return li.toHTTPStatus(err), fmt.Errorf("backend GetLeavesByRange request failed: %s", err)
+		return httpStatus, err
 	}
+
 	var currentRoot types.LogRootV1
 	if err := currentRoot.UnmarshalBinary(rsp.GetSignedLogRoot().GetLogRoot()); err != nil {
 		return http.StatusInternalServerError, fmt.Errorf("failed to unmarshal root: %v", rsp.GetSignedLogRoot().GetLogRoot())
@@ -746,6 +772,10 @@ func getEntries(ctx context.Context, li *logInfo, w http.ResponseWriter, r *http
 		// If the returned tree is too small to contain any leaves return the 4xx
 		// explicitly here.
 		return http.StatusBadRequest, fmt.Errorf("need tree size: %d to get leaves but only got: %d", start+1, currentRoot.TreeSize)
+	}
+	if *getEntriesMetrics {
+		label := strconv.FormatInt(req.LogId, 10)
+		recordStartPercent(start, currentRoot.TreeSize, label)
 	}
 	// Do some sanity checks on the result.
 	if len(rsp.Leaves) > int(count) {
@@ -783,6 +813,21 @@ func getEntries(ctx context.Context, li *logInfo, w http.ResponseWriter, r *http
 	return http.StatusOK, nil
 }
 
+// rpcGetLeavesByRange calls Trillian GetLeavesByRange RPC and fixes issuance chain in each log leaf if necessary.
+func rpcGetLeavesByRange(ctx context.Context, li *logInfo, req *trillian.GetLeavesByRangeRequest) (*trillian.GetLeavesByRangeResponse, int, error) {
+	rsp, err := li.rpcClient.GetLeavesByRange(ctx, req)
+	if err != nil {
+		return nil, li.toHTTPStatus(err), fmt.Errorf("backend GetLeavesByRange request failed: %s", err)
+	}
+	for _, leaf := range rsp.Leaves {
+		if err := li.issuanceChainService.FixLogLeaf(ctx, leaf); err != nil {
+			return nil, http.StatusInternalServerError, fmt.Errorf("failed to fix log leaf: %v", rsp)
+		}
+	}
+
+	return rsp, http.StatusOK, nil
+}
+
 func getRoots(_ context.Context, li *logInfo, w http.ResponseWriter, _ *http.Request) (int, error) {
 	// Pull out the raw certificates from the parsed versions
 	rawCerts := make([][]byte, 0, len(li.validationOpts.trustedRoots.RawCertificates()))
@@ -795,7 +840,7 @@ func getRoots(_ context.Context, li *logInfo, w http.ResponseWriter, _ *http.Req
 	enc := json.NewEncoder(w)
 	err := enc.Encode(jsonMap)
 	if err != nil {
-		glog.Warningf("%s: get_roots failed: %v", li.LogPrefix, err)
+		klog.Warningf("%s: get_roots failed: %v", li.LogPrefix, err)
 		return http.StatusInternalServerError, fmt.Errorf("get-roots failed with: %s", err)
 	}
 
@@ -819,9 +864,9 @@ func getEntryAndProof(ctx context.Context, li *logInfo, w http.ResponseWriter, r
 		TreeSize:  treeSize,
 		ChargeTo:  li.chargeUser(r),
 	}
-	rsp, err := li.rpcClient.GetEntryAndProof(ctx, &req)
+	rsp, httpStatus, err := rpcGetEntryAndProof(ctx, li, &req)
 	if err != nil {
-		return li.toHTTPStatus(err), fmt.Errorf("backend GetEntryAndProof request failed: %s", err)
+		return httpStatus, err
 	}
 
 	var currentRoot types.LogRootV1
@@ -866,6 +911,19 @@ func getEntryAndProof(ctx context.Context, li *logInfo, w http.ResponseWriter, r
 	return http.StatusOK, nil
 }
 
+// rpcGetEntryAndProof calls Trillian GetEntryAndProof RPC and fixes issuance chain in the log leaf if necessary.
+func rpcGetEntryAndProof(ctx context.Context, li *logInfo, req *trillian.GetEntryAndProofRequest) (*trillian.GetEntryAndProofResponse, int, error) {
+	rsp, err := li.rpcClient.GetEntryAndProof(ctx, req)
+	if err != nil {
+		return nil, li.toHTTPStatus(err), fmt.Errorf("backend GetEntryAndProof request failed: %s", err)
+	}
+	if err := li.issuanceChainService.FixLogLeaf(ctx, rsp.Leaf); err != nil {
+		return nil, http.StatusInternalServerError, fmt.Errorf("failed to fix log leaf: %v", rsp)
+	}
+
+	return rsp, http.StatusOK, nil
+}
+
 // getRPCDeadlineTime calculates the future time an RPC should expire based on our config
 func getRPCDeadlineTime(li *logInfo) time.Time {
 	return li.TimeSource.Now().Add(li.instanceOpts.Deadline)
@@ -890,31 +948,14 @@ func verifyAddChain(li *logInfo, req ct.AddChainRequest, expectingPrecert bool) 
 	// The type of the leaf must match the one the handler expects
 	if isPrecert != expectingPrecert {
 		if expectingPrecert {
-			glog.Warningf("%s: Cert (or precert with invalid CT ext) submitted as precert chain: %x", li.LogPrefix, req.Chain)
+			klog.Warningf("%s: Cert (or precert with invalid CT ext) submitted as precert chain: %q", li.LogPrefix, req.Chain)
 		} else {
-			glog.Warningf("%s: Precert (or cert with invalid CT ext) submitted as cert chain: %x", li.LogPrefix, req.Chain)
+			klog.Warningf("%s: Precert (or cert with invalid CT ext) submitted as cert chain: %q", li.LogPrefix, req.Chain)
 		}
 		return nil, fmt.Errorf("cert / precert mismatch: %T", expectingPrecert)
 	}
 
 	return validPath, nil
-}
-
-func extractRawCerts(chain []*x509.Certificate) []ct.ASN1Cert {
-	raw := make([]ct.ASN1Cert, len(chain))
-	for i, cert := range chain {
-		raw[i] = ct.ASN1Cert{Data: cert.Raw}
-	}
-	return raw
-}
-
-// buildLogLeafForAddChain does the hashing to build a LogLeaf that will be
-// sent to the backend by add-chain and add-pre-chain endpoints.
-func buildLogLeafForAddChain(li *logInfo,
-	merkleLeaf ct.MerkleTreeLeaf, chain []*x509.Certificate, isPrecert bool,
-) (trillian.LogLeaf, error) {
-	raw := extractRawCerts(chain)
-	return util.BuildLogLeaf(li.LogPrefix, merkleLeaf, 0, raw[0], raw[1:], isPrecert)
 }
 
 // marshalAndWriteAddChainResponse is used by add-chain and add-pre-chain to create and write
@@ -978,7 +1019,7 @@ func parseGetEntriesRange(r *http.Request, maxRange, logID int64) (int64, int64,
 		// of MaxGetEntriesAllowed.
 		// This is intended to coerce large runs of get-entries requests (e.g. by
 		// monitors/mirrors) into all requesting the same start/end ranges,
-		// thereby making the responses more readily cachable.
+		// thereby making the responses more readily cacheable.
 		d := (end + 1) % maxRange
 		end = end - d
 		alignedGetEntries.Inc(strconv.FormatInt(logID, 10), strconv.FormatBool(d == 0))
@@ -1053,14 +1094,14 @@ func marshalGetEntriesResponse(li *logInfo, leaves []*trillian.LogLeaf) (ct.GetE
 		// or data storage that should be investigated.
 		var treeLeaf ct.MerkleTreeLeaf
 		if rest, err := tls.Unmarshal(leaf.LeafValue, &treeLeaf); err != nil {
-			glog.Errorf("%s: Failed to deserialize Merkle leaf from backend: %d", li.LogPrefix, leaf.LeafIndex)
+			klog.Errorf("%s: Failed to deserialize Merkle leaf from backend: %d", li.LogPrefix, leaf.LeafIndex)
 		} else if len(rest) > 0 {
-			glog.Errorf("%s: Trailing data after Merkle leaf from backend: %d", li.LogPrefix, leaf.LeafIndex)
+			klog.Errorf("%s: Trailing data after Merkle leaf from backend: %d", li.LogPrefix, leaf.LeafIndex)
 		}
 
 		extraData := leaf.ExtraData
 		if len(extraData) == 0 {
-			glog.Errorf("%s: Missing ExtraData for leaf %d", li.LogPrefix, leaf.LeafIndex)
+			klog.Errorf("%s: Missing ExtraData for leaf %d", li.LogPrefix, leaf.LeafIndex)
 		}
 		jsonRsp.Entries = append(jsonRsp.Entries, ct.LeafEntry{
 			LeafInput: leaf.LeafValue,
@@ -1098,13 +1139,15 @@ func (li *logInfo) toHTTPStatus(err error) int {
 	case codes.OK:
 		return http.StatusOK
 	case codes.Canceled, codes.DeadlineExceeded:
-		return http.StatusRequestTimeout
+		return http.StatusGatewayTimeout
 	case codes.InvalidArgument, codes.OutOfRange, codes.AlreadyExists:
 		return http.StatusBadRequest
 	case codes.NotFound:
 		return http.StatusNotFound
-	case codes.PermissionDenied, codes.ResourceExhausted:
+	case codes.PermissionDenied:
 		return http.StatusForbidden
+	case codes.ResourceExhausted:
+		return http.StatusTooManyRequests
 	case codes.Unauthenticated:
 		return http.StatusUnauthorized
 	case codes.FailedPrecondition:
@@ -1117,5 +1160,14 @@ func (li *logInfo) toHTTPStatus(err error) int {
 		return http.StatusServiceUnavailable
 	default:
 		return http.StatusInternalServerError
+	}
+}
+
+// recordStartPercent works out what percentage of the current log size an index corresponds to,
+// and records this to the getEntriesStartPercentiles histogram.
+func recordStartPercent(leafIndex int64, treeSize uint64, labelVals ...string) {
+	if treeSize > 0 {
+		percent := float64(leafIndex) / float64(treeSize) * 100.0
+		getEntriesStartPercentiles.Observe(percent, labelVals...)
 	}
 }

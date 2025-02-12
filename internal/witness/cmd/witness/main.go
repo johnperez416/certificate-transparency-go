@@ -20,37 +20,41 @@ package main
 import (
 	"context"
 	"flag"
-	"io/ioutil"
+	"os"
 
-	"github.com/golang/glog"
 	"github.com/google/certificate-transparency-go/internal/witness/cmd/witness/impl"
-	"gopkg.in/yaml.v2"
+	"gopkg.in/yaml.v3"
+	"k8s.io/klog/v2"
 )
 
 var (
 	listenAddr = flag.String("listen", ":8000", "address:port to listen for requests on")
-	dbFile     = flag.String("db_file", ":memory:", "path to a file to be used as sqlite3 storage for STHs, e.g. /tmp/chkpts.db")
-	configFile = flag.String("config_file", "example_config.yaml", "path to a YAML config file that specifies the logs followed by this witness")
+	// If this is run with an in-memory database there is a good chance of the
+	// witness occasionally hitting a race condition and returning a 500.  If
+	// a file is specified this won't happen.
+	dbFile     = flag.String("db_file", ":memory:", "path to a file to be used as sqlite3 storage for STHs, e.g. /tmp/sths.db")
+	configFile = flag.String("config_file", "config/config.yaml", "path to a YAML config file that specifies the logs followed by this witness")
 	witnessSK  = flag.String("private_key", "", "private signing key for the witness")
 )
 
 func main() {
+	klog.InitFlags(nil)
 	flag.Parse()
 
 	if *witnessSK == "" {
-		glog.Exit("--private_key must not be empty")
+		klog.Exit("--private_key must not be empty")
 	}
 
 	if *configFile == "" {
-		glog.Exit("--config_file must not be empty")
+		klog.Exit("--config_file must not be empty")
 	}
-	fileData, err := ioutil.ReadFile(*configFile)
+	fileData, err := os.ReadFile(*configFile)
 	if err != nil {
-		glog.Exitf("Failed to read from config file: %v", err)
+		klog.Exitf("Failed to read from config file: %v", err)
 	}
 	var lc impl.LogConfig
 	if err := yaml.Unmarshal(fileData, &lc); err != nil {
-		glog.Exitf("Failed to parse config file as proper YAML: %v", err)
+		klog.Exitf("Failed to parse config file as proper YAML: %v", err)
 	}
 
 	ctx := context.Background()
@@ -60,6 +64,6 @@ func main() {
 		PrivKey:    *witnessSK,
 		Config:     lc,
 	}); err != nil {
-		glog.Exitf("Error running witness: %v", err)
+		klog.Exitf("Error running witness: %v", err)
 	}
 }

@@ -24,19 +24,15 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
-	"math/rand"
 	"net/http"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/golang/glog"
 	"github.com/google/certificate-transparency-go/client"
-	"github.com/google/certificate-transparency-go/fixchain/ratelimiter"
 	"github.com/google/certificate-transparency-go/jsonclient"
-	"github.com/google/certificate-transparency-go/loglist"
+	"github.com/google/certificate-transparency-go/loglist3"
 	"github.com/google/certificate-transparency-go/trillian/ctfe"
 	"github.com/google/certificate-transparency-go/trillian/ctfe/configpb"
 	"github.com/google/certificate-transparency-go/trillian/integration"
@@ -44,6 +40,8 @@ import (
 	"github.com/google/trillian/monitoring"
 	"github.com/google/trillian/monitoring/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"golang.org/x/time/rate"
+	"k8s.io/klog/v2"
 )
 
 var (
@@ -57,7 +55,7 @@ var (
 	srcLogURI       = flag.String("src_log_uri", "", "URI for source log to copy certificates from")
 	srcPubKey       = flag.String("src_pub_key", "", "Name of file containing source log's public key")
 	srcLogName      = flag.String("src_log_name", "", "Name of source log to copy certificate from  (from --log_list)")
-	logList         = flag.String("log_list", loglist.AllLogListURL, "Location of master log list (URL or filename)")
+	logList         = flag.String("log_list", loglist3.AllLogListURL, "Location of master log list (URL or filename)")
 	skipHTTPSVerify = flag.Bool("skip_https_verify", false, "Skip verification of HTTPS transport connection to source log")
 	chainBufSize    = flag.Int("buffered_chains", 100, "Number of buffered certificate chains to hold")
 	startIndex      = flag.Int64("start_index", 0, "Index of start point in source log to scan from (-1 for random start index)")
@@ -65,7 +63,6 @@ var (
 	parallelFetch   = flag.Int("parallel_fetch", 2, "Number of concurrent GetEntries fetches")
 
 	metricsEndpoint     = flag.String("metrics_endpoint", "", "Endpoint for serving metrics; if left empty, metrics will not be exposed")
-	seed                = flag.Int64("seed", -1, "Seed for random number generation")
 	logConfig           = flag.String("log_config", "", "File holding log config in JSON")
 	mmd                 = flag.Duration("mmd", 2*time.Minute, "Default MMD for logs")
 	operations          = flag.Uint64("operations", ^uint64(0), "Number of operations to perform")
@@ -92,11 +89,11 @@ var (
 	strictSTHConsistencySize = flag.Bool("strict_sth_consistency_size", true, "If set to true, hammer will use only tree sizes from STHs it's seen for consistency proofs, otherwise it'll choose a random size for the smaller tree")
 )
 
-func newLimiter(rate int) integration.Limiter {
-	if rate <= 0 {
+func newLimiter(limit int) integration.Limiter {
+	if limit <= 0 {
 		return nil
 	}
-	return ratelimiter.NewLimiter(rate)
+	return rate.NewLimiter(rate.Limit(limit), 1)
 }
 
 // copierGeneratorFactory returns a function that creates per-Log ChainGenerator instances
@@ -104,7 +101,7 @@ func newLimiter(rate int) integration.Limiter {
 func copierGeneratorFactory(ctx context.Context) integration.GeneratorFactory {
 	var tlsCfg *tls.Config
 	if *skipHTTPSVerify {
-		glog.Warning("Skipping HTTPS connection verification")
+		klog.Warning("Skipping HTTPS connection verification")
 		tlsCfg = &tls.Config{InsecureSkipVerify: *skipHTTPSVerify}
 	}
 	httpClient := &http.Client{
@@ -123,32 +120,32 @@ func copierGeneratorFactory(ctx context.Context) integration.GeneratorFactory {
 	uri := *srcLogURI
 	var opts jsonclient.Options
 	if *srcPubKey != "" {
-		pubkey, err := ioutil.ReadFile(*srcPubKey)
+		pubkey, err := os.ReadFile(*srcPubKey)
 		if err != nil {
-			glog.Exit(err)
+			klog.Exit(err)
 		}
 		opts.PublicKey = string(pubkey)
 	}
 	if len(*srcLogName) > 0 {
 		llData, err := x509util.ReadFileOrURL(*logList, httpClient)
 		if err != nil {
-			glog.Exitf("Failed to read log list: %v", err)
+			klog.Exitf("Failed to read log list: %v", err)
 		}
-		ll, err := loglist.NewFromJSON(llData)
+		ll, err := loglist3.NewFromJSON(llData)
 		if err != nil {
-			glog.Exitf("Failed to build log list: %v", err)
+			klog.Exitf("Failed to build log list: %v", err)
 		}
 
 		logs := ll.FindLogByName(*srcLogName)
 		if len(logs) == 0 {
-			glog.Exitf("No log with name like %q found in loglist %q", *srcLogName, *logList)
+			klog.Exitf("No log with name like %q found in loglist %q", *srcLogName, *logList)
 		}
 		if len(logs) > 1 {
 			logNames := make([]string, len(logs))
 			for i, log := range logs {
 				logNames[i] = fmt.Sprintf("%q", log.Description)
 			}
-			glog.Exitf("Multiple logs with name like %q found in loglist: %s", *srcLogName, strings.Join(logNames, ","))
+			klog.Exitf("Multiple logs with name like %q found in loglist: %s", *srcLogName, strings.Join(logNames, ","))
 		}
 		uri = "https://" + logs[0].URL
 		if opts.PublicKey == "" {
@@ -158,9 +155,9 @@ func copierGeneratorFactory(ctx context.Context) integration.GeneratorFactory {
 
 	logClient, err := client.New(uri, httpClient, opts)
 	if err != nil {
-		glog.Exitf("Failed to create client for %q: %v", uri, err)
+		klog.Exitf("Failed to create client for %q: %v", uri, err)
 	}
-	glog.Infof("Testing with certs copied from log at %s starting at index %d", uri, *startIndex)
+	klog.Infof("Testing with certs copied from log at %s starting at index %d", uri, *startIndex)
 	genOpts := integration.CopyChainOptions{
 		StartIndex:    *startIndex,
 		BufSize:       *chainBufSize,
@@ -173,19 +170,15 @@ func copierGeneratorFactory(ctx context.Context) integration.GeneratorFactory {
 }
 
 func main() {
+	klog.InitFlags(nil)
 	flag.Parse()
 	if *logConfig == "" {
-		glog.Exit("Test aborted as no log config provided (via --log_config)")
+		klog.Exit("Test aborted as no log config provided (via --log_config)")
 	}
-	if *seed == -1 {
-		*seed = time.Now().UTC().UnixNano() & 0xFFFFFFFF
-	}
-	fmt.Printf("Today's test has been brought to you by the letters C and T and the number %#x\n", *seed)
-	rand.Seed(*seed)
 
 	cfg, err := ctfe.LogConfigFromFile(*logConfig)
 	if err != nil {
-		glog.Exitf("Failed to read log config: %v", err)
+		klog.Exitf("Failed to read log config: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -197,15 +190,15 @@ func main() {
 	} else if *testDir != "" {
 		// Test cert chains will be generated as synthetic certs from a template.
 		// Retrieve the test data holding the template and key.
-		glog.Infof("Testing with synthetic certs based on data from %s", *testDir)
+		klog.Infof("Testing with synthetic certs based on data from %s", *testDir)
 		generatorFactory, err = integration.SyntheticGeneratorFactory(*testDir, *leafNotAfter)
 		if err != nil {
-			glog.Exitf("Failed to make cert generator: %v", err)
+			klog.Exitf("Failed to make cert generator: %v", err)
 		}
 	}
 
 	if generatorFactory == nil {
-		glog.Warningf("Warning: add-[pre-]chain operations disabled as no cert generation method available")
+		klog.Warningf("Warning: add-[pre-]chain operations disabled as no cert generation method available")
 		*addChainBias = 0
 		*addPreChainBias = 0
 		generatorFactory = func(c *configpb.LogConfig) (integration.ChainGenerator, error) {
@@ -241,10 +234,10 @@ func main() {
 		mf = prometheus.MetricFactory{}
 		http.Handle("/metrics", promhttp.Handler())
 		server := http.Server{Addr: *metricsEndpoint, Handler: nil}
-		glog.Infof("Serving metrics at %v", *metricsEndpoint)
+		klog.Infof("Serving metrics at %v", *metricsEndpoint)
 		go func() {
 			err := server.ListenAndServe()
-			glog.Warningf("Metrics server exited: %v", err)
+			klog.Warningf("Metrics server exited: %v", err)
 		}()
 	} else {
 		mf = monitoring.InertMetricFactory{}
@@ -260,8 +253,12 @@ func main() {
 		mcData, _ := base64.StdEncoding.DecodeString(mc)
 		b := bytes.NewReader(mcData)
 		r, _ := gzip.NewReader(b)
-		io.Copy(os.Stdout, r)
-		r.Close()
+		if _, err := io.Copy(os.Stdout, r); err != nil {
+			klog.Exitf("Failed to print banner!")
+		}
+		if err := r.Close(); err != nil {
+			klog.Exitf("Failed to close reader: %v", err)
+		}
 		fmt.Print("\n\nHammer Time\n\n")
 	}
 
@@ -275,7 +272,7 @@ func main() {
 		wg.Add(1)
 		pool, err := integration.NewRandomPool(*httpServers, c.PublicKey, c.Prefix)
 		if err != nil {
-			glog.Exitf("Failed to create client pool: %v", err)
+			klog.Exitf("Failed to create client pool: %v", err)
 		}
 
 		mmd := *mmd
@@ -287,7 +284,7 @@ func main() {
 
 		generator, err := generatorFactory(c)
 		if err != nil {
-			glog.Exitf("Failed to build chain generator: %v", err)
+			klog.Exitf("Failed to build chain generator: %v", err)
 		}
 
 		cfg := integration.HammerConfig{
@@ -311,23 +308,23 @@ func main() {
 		}
 		go func(cfg integration.HammerConfig) {
 			defer wg.Done()
-			err := integration.HammerCTLog(cfg)
+			err := integration.HammerCTLog(ctx, cfg)
 			results <- result{prefix: cfg.LogCfg.Prefix, err: err}
 		}(cfg)
 	}
 	wg.Wait()
 
-	glog.Infof("completed tests on all %d logs:", len(cfg))
+	klog.Infof("completed tests on all %d logs:", len(cfg))
 	close(results)
 	errCount := 0
 	for e := range results {
 		if e.err != nil {
 			errCount++
-			glog.Errorf("  %s: failed with %v", e.prefix, e.err)
+			klog.Errorf("  %s: failed with %v", e.prefix, e.err)
 		}
 	}
 	if errCount > 0 {
-		glog.Exitf("non-zero error count (%d), exiting", errCount)
+		klog.Exitf("non-zero error count (%d), exiting", errCount)
 	}
-	glog.Info("  no errors; done")
+	klog.Info("  no errors; done")
 }

@@ -23,20 +23,21 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/glog"
 	"github.com/google/certificate-transparency-go/client"
 	"github.com/google/certificate-transparency-go/ctpolicy"
-	"github.com/google/certificate-transparency-go/loglist2"
+	"github.com/google/certificate-transparency-go/loglist3"
 	"github.com/google/certificate-transparency-go/schedule"
 	"github.com/google/certificate-transparency-go/testdata"
+	"github.com/google/certificate-transparency-go/trillian/ctfe"
 	"github.com/google/certificate-transparency-go/x509"
 	"github.com/google/certificate-transparency-go/x509util"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/google/trillian/monitoring"
+	"k8s.io/klog/v2"
 )
 
-func newLocalStubLogClient(log *loglist2.Log) (client.AddLogClient, error) {
+func newLocalStubLogClient(log *loglist3.Log) (client.AddLogClient, error) {
 	return newRootedStubLogClient(log, RootsCerts)
 }
 
@@ -54,7 +55,7 @@ func ExampleDistributor() {
 	refresh := make(chan struct{})
 	go schedule.Every(ctx, time.Hour, func(ctx context.Context) {
 		if errs := d.RefreshRoots(ctx); len(errs) > 0 {
-			glog.Error(errs)
+			klog.Error(errs)
 		}
 		refresh <- struct{}{}
 	})
@@ -100,19 +101,19 @@ var (
 )
 
 // newNoLogClient is LogClientBuilder that always fails.
-func newNoLogClient(_ *loglist2.Log) (client.AddLogClient, error) {
+func newNoLogClient(_ *loglist3.Log) (client.AddLogClient, error) {
 	return nil, errors.New("bad log-client builder")
 }
 
-func sampleLogList() *loglist2.LogList {
-	var ll loglist2.LogList
-	if err := json.Unmarshal([]byte(testdata.SampleLogList2), &ll); err != nil {
-		panic(fmt.Errorf("unable to Unmarshal testdata.SampleLogList: %v", err))
+func sampleLogList() *loglist3.LogList {
+	var ll loglist3.LogList
+	if err := json.Unmarshal([]byte(testdata.SampleLogList3), &ll); err != nil {
+		panic(fmt.Errorf("unable to Unmarshal testdata.SampleLogList3: %v", err))
 	}
 	return &ll
 }
 
-func sampleValidLogList() *loglist2.LogList {
+func sampleValidLogList() *loglist3.LogList {
 	ll := sampleLogList()
 	// Id of invalid Log description Racketeer
 	inval := 2
@@ -120,15 +121,15 @@ func sampleValidLogList() *loglist2.LogList {
 	return ll
 }
 
-func sampleUncollectableLogList() *loglist2.LogList {
+func sampleUncollectableLogList() *loglist3.LogList {
 	ll := sampleValidLogList()
 	// Append loglist that is unable to provide roots on request.
-	ll.Operators[0].Logs = append(ll.Operators[0].Logs, &loglist2.Log{
+	ll.Operators[0].Logs = append(ll.Operators[0].Logs, &loglist3.Log{
 		Description: "Does not return roots", Key: []byte("VW5jb2xsZWN0YWJsZUxvZ0xpc3Q="),
 		URL:   "uncollectable-roots/log/",
-		DNS:   "uncollectavle.ct.googleapis.com",
+		DNS:   "uncollectable.ct.googleapis.com",
 		MMD:   123,
-		State: &loglist2.LogStates{Usable: &loglist2.LogState{}},
+		State: &loglist3.LogStates{Usable: &loglist3.LogState{}},
 	})
 	return ll
 }
@@ -136,7 +137,7 @@ func sampleUncollectableLogList() *loglist2.LogList {
 func TestNewDistributorLogClients(t *testing.T) {
 	testCases := []struct {
 		name      string
-		ll        *loglist2.LogList
+		ll        *loglist3.LogList
 		lcBuilder LogClientBuilder
 		errRegexp *regexp.Regexp
 	}{
@@ -153,7 +154,7 @@ func TestNewDistributorLogClients(t *testing.T) {
 		},
 		{
 			name:      "NoLogClientsEmptyLogList",
-			ll:        &loglist2.LogList{},
+			ll:        &loglist3.LogList{},
 			lcBuilder: newNoLogClient,
 		},
 	}
@@ -176,10 +177,11 @@ func TestNewDistributorLogClients(t *testing.T) {
 
 func TestNewDistributorRootPools(t *testing.T) {
 	testCases := []struct {
-		name     string
-		ll       *loglist2.LogList
-		rootNum  map[string]int
-		wantErrs int
+		name               string
+		ll                 *loglist3.LogList
+		rootNum            map[string]int
+		wantErrs           int
+		distributorOptions []DistributorOption
 	}{
 		{
 			name: "InactiveZeroRoots",
@@ -189,18 +191,34 @@ func TestNewDistributorRootPools(t *testing.T) {
 			wantErrs: 1,
 		},
 		{
+			name: "InactiveZeroRoots-NoRootChecking",
+			ll:   sampleValidLogList(),
+			// aviator is not active; 1 of 2 icarus roots is not x509 struct
+			rootNum:            map[string]int{"https://ct.googleapis.com/aviator/": 0, "https://ct.googleapis.com/rocketeer/": 0, "https://ct.googleapis.com/icarus/": 0},
+			wantErrs:           0,
+			distributorOptions: []DistributorOption{DisableRootCompatibilityCheckingDistributorOption{}},
+		},
+		{
 			name: "CouldNotCollect",
 			ll:   sampleUncollectableLogList(),
 			// aviator is not active; uncollectable client cannot provide roots
 			rootNum:  map[string]int{"https://ct.googleapis.com/aviator/": 0, "https://ct.googleapis.com/rocketeer/": 4, "https://ct.googleapis.com/icarus/": 1, "uncollectable-roots/log/": 0},
 			wantErrs: 2,
 		},
+		{
+			name: "CouldNotCollect-NoRootChecking",
+			ll:   sampleUncollectableLogList(),
+			// aviator is not active; uncollectable client cannot provide roots
+			rootNum:            map[string]int{"https://ct.googleapis.com/aviator/": 0, "https://ct.googleapis.com/rocketeer/": 0, "https://ct.googleapis.com/icarus/": 0, "uncollectable-roots/log/": 0},
+			wantErrs:           0,
+			distributorOptions: []DistributorOption{DisableRootCompatibilityCheckingDistributorOption{}},
+		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
-			dist, _ := NewDistributor(tc.ll, ctpolicy.ChromeCTPolicy{}, newLocalStubLogClient, monitoring.InertMetricFactory{})
+			dist, _ := NewDistributor(tc.ll, ctpolicy.ChromeCTPolicy{}, newLocalStubLogClient, monitoring.InertMetricFactory{}, tc.distributorOptions...)
 
 			if errs := dist.RefreshRoots(ctx); len(errs) != tc.wantErrs {
 				t.Errorf("dist.RefreshRoots() = %v, want %d errors", errs, tc.wantErrs)
@@ -240,7 +258,7 @@ func buildStubCTPolicy(n int) stubCTPolicy {
 	return stubCTPolicy{baseNum: n}
 }
 
-func (stubP stubCTPolicy) LogsByGroup(cert *x509.Certificate, approved *loglist2.LogList) (ctpolicy.LogPolicyData, error) {
+func (stubP stubCTPolicy) LogsByGroup(cert *x509.Certificate, approved *loglist3.LogList) (ctpolicy.LogPolicyData, error) {
 	baseGroup, err := ctpolicy.BaseGroupFor(approved, stubP.baseNum)
 	groups := ctpolicy.LogPolicyData{baseGroup.Name: baseGroup}
 	return groups, err
@@ -253,12 +271,12 @@ func (stubP stubCTPolicy) Name() string {
 func TestDistributorAddChain(t *testing.T) {
 	testCases := []struct {
 		name         string
-		ll           *loglist2.LogList
+		ll           *loglist3.LogList
 		plc          ctpolicy.CTPolicy
 		pemChainFile string
 		getRoots     bool
 		scts         []*AssignedSCT
-		wantErr      bool
+		wantErr      error
 	}{
 		{
 			name:         "MalformedChainRequest with log roots available",
@@ -267,7 +285,7 @@ func TestDistributorAddChain(t *testing.T) {
 			pemChainFile: "../trillian/testdata/subleaf.misordered.chain",
 			getRoots:     true,
 			scts:         nil,
-			wantErr:      true,
+			wantErr:      ctfe.ErrNoRFCCompliantPathFound,
 		},
 		{
 			name:         "MalformedChainRequest without log roots available",
@@ -276,7 +294,7 @@ func TestDistributorAddChain(t *testing.T) {
 			pemChainFile: "../trillian/testdata/subleaf.misordered.chain",
 			getRoots:     false,
 			scts:         nil,
-			wantErr:      true,
+			wantErr:      ErrDistributorNotEnoughCompatibleLogs,
 		},
 		{
 			name:         "CallBeforeInit",
@@ -284,7 +302,7 @@ func TestDistributorAddChain(t *testing.T) {
 			plc:          ctpolicy.ChromeCTPolicy{},
 			pemChainFile: "",
 			scts:         nil,
-			wantErr:      true,
+			wantErr:      ErrDistributorUnableToProcessEmptyChain,
 		},
 		{
 			name:         "InsufficientSCTsForPolicy",
@@ -293,7 +311,7 @@ func TestDistributorAddChain(t *testing.T) {
 			pemChainFile: "../trillian/testdata/subleaf.chain", // subleaf chain is fake-ca-1-rooted
 			getRoots:     true,
 			scts:         []*AssignedSCT{},
-			wantErr:      true, // Not enough SCTs for policy
+			wantErr:      ErrDistributorNotEnoughCompatibleLogs,
 		},
 		{
 			name:         "FullChain1Policy",
@@ -307,7 +325,6 @@ func TestDistributorAddChain(t *testing.T) {
 					SCT:    testSCT("https://ct.googleapis.com/rocketeer/"),
 				},
 			},
-			wantErr: false,
 		},
 		// TODO(merkulova): Add tests to cover more cases where log roots aren't available
 	}
@@ -326,10 +343,10 @@ func TestDistributorAddChain(t *testing.T) {
 			}
 
 			scts, err := dist.AddChain(context.Background(), pemFileToDERChain(tc.pemChainFile), false /* loadPendingLogs */)
-
-			if gotErr := err != nil; gotErr != tc.wantErr {
-				t.Fatalf("dist.AddChain(from %q) = (_, error: %v), want err? %t", tc.pemChainFile, err, tc.wantErr)
-			} else if gotErr {
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("dist.AddPreChain(from %q) = (_, error: %v), want err? %t", tc.pemChainFile, err, tc.wantErr)
+			}
+			if err != nil {
 				return
 			}
 
@@ -349,12 +366,12 @@ func TestDistributorAddChain(t *testing.T) {
 func TestDistributorAddPreChain(t *testing.T) {
 	testCases := []struct {
 		name         string
-		ll           *loglist2.LogList
+		ll           *loglist3.LogList
 		plc          ctpolicy.CTPolicy
 		pemChainFile string
 		getRoots     bool
 		scts         []*AssignedSCT
-		wantErr      bool
+		wantErr      error
 	}{
 		{
 			name:         "MalformedChainRequest with log roots available",
@@ -363,7 +380,7 @@ func TestDistributorAddPreChain(t *testing.T) {
 			pemChainFile: "../trillian/testdata/subleaf-pre.misordered.chain",
 			getRoots:     true,
 			scts:         nil,
-			wantErr:      true,
+			wantErr:      ctfe.ErrNoRFCCompliantPathFound,
 		},
 		{
 			name:         "MalformedChainRequest without log roots available",
@@ -372,7 +389,7 @@ func TestDistributorAddPreChain(t *testing.T) {
 			pemChainFile: "../trillian/testdata/subleaf-pre.misordered.chain",
 			getRoots:     false,
 			scts:         nil,
-			wantErr:      true,
+			wantErr:      ErrDistributorNotEnoughCompatibleLogs,
 		},
 		{
 			name:         "CallBeforeInit",
@@ -380,7 +397,7 @@ func TestDistributorAddPreChain(t *testing.T) {
 			plc:          ctpolicy.ChromeCTPolicy{},
 			pemChainFile: "",
 			scts:         nil,
-			wantErr:      true,
+			wantErr:      ErrDistributorUnableToProcessEmptyChain,
 		},
 		{
 			name:         "InsufficientSCTsForPolicy",
@@ -389,7 +406,7 @@ func TestDistributorAddPreChain(t *testing.T) {
 			pemChainFile: "../trillian/testdata/subleaf-pre.chain", // subleaf chain is fake-ca-1-rooted
 			getRoots:     true,
 			scts:         []*AssignedSCT{},
-			wantErr:      true, // Not enough SCTs for policy
+			wantErr:      ErrDistributorNotEnoughCompatibleLogs,
 		},
 		{
 			name:         "FullChain1Policy",
@@ -403,7 +420,6 @@ func TestDistributorAddPreChain(t *testing.T) {
 					SCT:    testSCT("https://ct.googleapis.com/rocketeer/"),
 				},
 			},
-			wantErr: false,
 		},
 		// TODO(merkulova): Add tests to cover more cases where log roots aren't available
 	}
@@ -422,10 +438,10 @@ func TestDistributorAddPreChain(t *testing.T) {
 			}
 
 			scts, err := dist.AddPreChain(context.Background(), pemFileToDERChain(tc.pemChainFile), true /* loadPendingLogs */)
-
-			if gotErr := err != nil; gotErr != tc.wantErr {
+			if !errors.Is(err, tc.wantErr) {
 				t.Fatalf("dist.AddPreChain(from %q) = (_, error: %v), want err? %t", tc.pemChainFile, err, tc.wantErr)
-			} else if gotErr {
+			}
+			if err != nil {
 				return
 			}
 

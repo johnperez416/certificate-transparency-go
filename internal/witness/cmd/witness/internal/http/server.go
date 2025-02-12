@@ -18,14 +18,16 @@ package http
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
+	"net/url"
 
 	"github.com/google/certificate-transparency-go/internal/witness/api"
 	"github.com/google/certificate-transparency-go/internal/witness/cmd/witness/internal/witness"
 	"github.com/gorilla/mux"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"k8s.io/klog/v2"
 )
 
 // Server is the core handler implementation of the witness.
@@ -45,8 +47,11 @@ func NewServer(witness *witness.Witness) *Server {
 // statement and returns a JSON-formatted api.UpdateResponse statement.
 func (s *Server) update(w http.ResponseWriter, r *http.Request) {
 	v := mux.Vars(r)
-	logID := v["logid"]
-	body, err := ioutil.ReadAll(r.Body)
+	logID, err := url.PathUnescape(v["logid"])
+	if err != nil {
+		http.Error(w, fmt.Sprintf("cannot parse URL: %v", err.Error()), http.StatusBadRequest)
+	}
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("cannot read request body: %v", err.Error()), http.StatusBadRequest)
 		return
@@ -62,25 +67,28 @@ func (s *Server) update(w http.ResponseWriter, r *http.Request) {
 		// If there was a failed precondition it's possible the caller was
 		// just out of date.  Give the returned STH to help them
 		// form a new request.
-		if status.Code(err) == codes.FailedPrecondition {
-			// This is the implementation of http.Error except we don't add any trailing newline chars.
-			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		if c := status.Code(err); c == codes.FailedPrecondition {
 			w.Header().Set("X-Content-Type-Options", "nosniff")
-			w.WriteHeader(http.StatusConflict)
-			fmt.Fprint(w, err)
+			w.WriteHeader(httpForCode(c))
+			// The returned STH gets written a few lines below.
+		} else {
+			http.Error(w, fmt.Sprintf("failed to update to new STH: %v", err), httpForCode(http.StatusInternalServerError))
 			return
 		}
-		http.Error(w, fmt.Sprintf("failed to update to new STH: %v", err), httpForCode(http.StatusInternalServerError))
-		return
 	}
 	w.Header().Set("Content-Type", "text/plain")
-	w.Write(sth)
+	if _, err := w.Write(sth); err != nil {
+		klog.Errorf("Write(): %v", err)
+	}
 }
 
 // getSTH returns an STH stored for a given log.
 func (s *Server) getSTH(w http.ResponseWriter, r *http.Request) {
 	v := mux.Vars(r)
-	logID := v["logid"]
+	logID, err := url.PathUnescape(v["logid"])
+	if err != nil {
+		http.Error(w, fmt.Sprintf("cannot parse URL: %v", err.Error()), http.StatusBadRequest)
+	}
 	// Get the STH from the witness.
 	sth, err := s.w.GetSTH(logID)
 	if err != nil {
@@ -88,7 +96,9 @@ func (s *Server) getSTH(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain")
-	w.Write(sth)
+	if _, err := w.Write(sth); err != nil {
+		klog.Errorf("Write(): %v", err)
+	}
 }
 
 // getLogs returns a list of all logs the witness is aware of.
@@ -104,7 +114,9 @@ func (s *Server) getLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/json")
-	w.Write(logList)
+	if _, err := w.Write(logList); err != nil {
+		klog.Errorf("Write(): %v", err)
+	}
 }
 
 // RegisterHandlers registers HTTP handlers for witness endpoints.

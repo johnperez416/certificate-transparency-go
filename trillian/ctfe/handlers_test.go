@@ -26,14 +26,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/golang/glog"
 	"github.com/golang/mock/gomock"
 	"github.com/google/certificate-transparency-go/tls"
 	"github.com/google/certificate-transparency-go/trillian/mockclient"
@@ -50,6 +48,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	"k8s.io/klog/v2"
 
 	ct "github.com/google/certificate-transparency-go"
 	"github.com/google/certificate-transparency-go/trillian/ctfe/configpb"
@@ -109,7 +108,7 @@ const remoteQuotaUser = "Moneybags"
 
 type handlerTestInfo struct {
 	mockCtrl *gomock.Controller
-	roots    *PEMCertPool
+	roots    *x509util.PEMCertPool
 	client   *mockclient.MockTrillianLogClient
 	li       *logInfo
 }
@@ -154,7 +153,7 @@ func setupTest(t *testing.T, pemRoots []string, signer crypto.Signer) handlerTes
 	t.Helper()
 	info := handlerTestInfo{
 		mockCtrl: gomock.NewController(t),
-		roots:    NewPEMCertPool(),
+		roots:    x509util.NewPEMCertPool(),
 	}
 
 	info.client = mockclient.NewMockTrillianLogClient(info.mockCtrl)
@@ -166,11 +165,11 @@ func setupTest(t *testing.T, pemRoots []string, signer crypto.Signer) handlerTes
 	cfg := &configpb.LogConfig{LogId: 0x42, Prefix: "test", IsMirror: false}
 	vCfg := &ValidatedLogConfig{Config: cfg}
 	iOpts := InstanceOptions{Validated: vCfg, Client: info.client, Deadline: time.Millisecond * 500, MetricFactory: monitoring.InertMetricFactory{}, RequestLog: new(DefaultRequestLog)}
-	info.li = newLogInfo(iOpts, vOpts, signer, fakeTimeSource)
+	info.li = newLogInfo(iOpts, vOpts, signer, fakeTimeSource, &directIssuanceChainService{})
 
 	for _, pemRoot := range pemRoots {
 		if !info.roots.AppendCertsFromPEM([]byte(pemRoot)) {
-			glog.Fatal("failed to load cert pool")
+			klog.Fatal("failed to load cert pool")
 		}
 	}
 
@@ -312,7 +311,7 @@ func TestGetRoots(t *testing.T) {
 	defer info.mockCtrl.Finish()
 	handler := AppHandler{Info: info.li, Handler: getRoots, Name: "GetRoots", Method: http.MethodGet}
 
-	req, err := http.NewRequest("GET", "http://example.com/ct/v1/get-roots", nil)
+	req, err := http.NewRequest(http.MethodGet, "http://example.com/ct/v1/get-roots", nil)
 	if err != nil {
 		t.Fatalf("Failed to create request: %v", err)
 	}
@@ -421,7 +420,7 @@ func TestAddChainWhitespace(t *testing.T) {
 
 			recorder := httptest.NewRecorder()
 			handler := AppHandler{Info: info.li, Handler: addChain, Name: "AddChain", Method: http.MethodPost}
-			req, err := http.NewRequest("POST", "http://example.com/ct/v1/add-chain", strings.NewReader(test.body))
+			req, err := http.NewRequest(http.MethodPost, "http://example.com/ct/v1/add-chain", strings.NewReader(test.body))
 			if err != nil {
 				t.Fatalf("Failed to create POST request: %v", err)
 			}
@@ -776,7 +775,7 @@ func TestGetSTH(t *testing.T) {
 				srReq.ChargeTo = &trillian.ChargeTo{User: []string{test.wantQuotaUser}}
 			}
 			info.client.EXPECT().GetLatestSignedLogRoot(deadlineMatcher(), cmpMatcher{srReq}).Return(test.rpcRsp, test.rpcErr)
-			req, err := http.NewRequest("GET", "http://example.com/ct/v1/get-sth", nil)
+			req, err := http.NewRequest(http.MethodGet, "http://example.com/ct/v1/get-sth", nil)
 			if err != nil {
 				t.Errorf("Failed to create request: %v", err)
 				return
@@ -1011,7 +1010,7 @@ func TestGetEntries(t *testing.T) {
 		info.setRemoteQuotaUser(test.wantQuotaUser)
 		handler := AppHandler{Info: info.li, Handler: getEntries, Name: "GetEntries", Method: http.MethodGet}
 		path := fmt.Sprintf("/ct/v1/get-entries?%s", test.req)
-		req, err := http.NewRequest("GET", path, nil)
+		req, err := http.NewRequest(http.MethodGet, path, nil)
 		if err != nil {
 			t.Errorf("Failed to create request: %v", err)
 			continue
@@ -1188,7 +1187,7 @@ func TestGetEntriesRanges(t *testing.T) {
 			}
 
 			path := fmt.Sprintf("/ct/v1/get-entries?start=%d&end=%d", test.start, test.end)
-			req, err := http.NewRequest("GET", path, nil)
+			req, err := http.NewRequest(http.MethodGet, path, nil)
 			if err != nil {
 				t.Fatalf("Failed to create request: %v", err)
 			}
@@ -1445,7 +1444,7 @@ func TestGetProofByHash(t *testing.T) {
 
 	for _, test := range tests {
 		info.setRemoteQuotaUser(test.wantQuotaUser)
-		req, err := http.NewRequest("GET", fmt.Sprintf("/ct/v1/proof-by-hash?%s", test.req), nil)
+		req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("/ct/v1/proof-by-hash?%s", test.req), nil)
 		if err != nil {
 			t.Errorf("Failed to create request: %v", err)
 			continue
@@ -1470,7 +1469,7 @@ func TestGetProofByHash(t *testing.T) {
 		if got, want := w.Header().Get("Cache-Control"), "public"; !strings.Contains(got, want) {
 			t.Errorf("proofByHash(%q): Cache-Control response header = %q, want %q", test.req, got, want)
 		}
-		jsonData, err := ioutil.ReadAll(w.Body)
+		jsonData, err := io.ReadAll(w.Body)
 		if err != nil {
 			t.Errorf("failed to read response body: %v", err)
 			continue
@@ -1793,7 +1792,7 @@ func TestGetSTHConsistency(t *testing.T) {
 
 	for _, test := range tests {
 		info.setRemoteQuotaUser(test.wantQuotaUser)
-		req, err := http.NewRequest("GET", fmt.Sprintf("/ct/v1/get-sth-consistency?%s", test.req), nil)
+		req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("/ct/v1/get-sth-consistency?%s", test.req), nil)
 		if err != nil {
 			t.Errorf("Failed to create request: %v", err)
 			continue
@@ -1826,7 +1825,7 @@ func TestGetSTHConsistency(t *testing.T) {
 		if got, want := w.Header().Get("Cache-Control"), "public"; !strings.Contains(got, want) {
 			t.Errorf("getSTHConsistency(%q): Cache-Control response header = %q, want %q", test.req, got, want)
 		}
-		jsonData, err := ioutil.ReadAll(w.Body)
+		jsonData, err := io.ReadAll(w.Body)
 		if err != nil {
 			t.Errorf("failed to read response body: %v", err)
 			continue
@@ -2127,7 +2126,7 @@ func TestGetEntryAndProof(t *testing.T) {
 
 	for _, test := range tests {
 		info.setRemoteQuotaUser(test.wantQuotaUser)
-		req, err := http.NewRequest("GET", fmt.Sprintf("/ct/v1/get-entry-and-proof?%s", test.req), nil)
+		req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("/ct/v1/get-entry-and-proof?%s", test.req), nil)
 		if err != nil {
 			t.Errorf("Failed to create request: %v", err)
 			continue
@@ -2172,7 +2171,7 @@ func TestGetEntryAndProof(t *testing.T) {
 	}
 }
 
-func createJSONChain(t *testing.T, p PEMCertPool) io.Reader {
+func createJSONChain(t *testing.T, p x509util.PEMCertPool) io.Reader {
 	t.Helper()
 	var req ct.AddChainRequest
 	for _, rawCert := range p.RawCertificates() {
@@ -2251,7 +2250,7 @@ func makeAddChainRequest(t *testing.T, li *logInfo, body io.Reader) *httptest.Re
 
 func makeAddChainRequestInternal(t *testing.T, handler AppHandler, path string, body io.Reader) *httptest.ResponseRecorder {
 	t.Helper()
-	req, err := http.NewRequest("POST", fmt.Sprintf("http://example.com/ct/v1/%s", path), body)
+	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("http://example.com/ct/v1/%s", path), body)
 	if err != nil {
 		t.Fatalf("Failed to create POST request: %v", err)
 	}
@@ -2273,9 +2272,9 @@ func makeGetRootResponseForTest(t *testing.T, stamp, treeSize int64, hash []byte
 	}
 }
 
-func loadCertsIntoPoolOrDie(t *testing.T, certs []string) *PEMCertPool {
+func loadCertsIntoPoolOrDie(t *testing.T, certs []string) *x509util.PEMCertPool {
 	t.Helper()
-	pool := NewPEMCertPool()
+	pool := x509util.NewPEMCertPool()
 	for _, cert := range certs {
 		if !pool.AppendCertsFromPEM([]byte(cert)) {
 			t.Fatalf("couldn't parse test certs: %v", certs)

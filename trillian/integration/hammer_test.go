@@ -20,7 +20,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"testing"
@@ -32,6 +31,7 @@ import (
 	"github.com/google/certificate-transparency-go/trillian/ctfe/configpb"
 	"github.com/google/certificate-transparency-go/x509"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	"k8s.io/klog/v2"
 
 	ct "github.com/google/certificate-transparency-go"
 )
@@ -179,7 +179,7 @@ type fakeCTServer struct {
 }
 
 func (s *fakeCTServer) addChain(w http.ResponseWriter, req *http.Request) {
-	body, err := ioutil.ReadAll(req.Body)
+	body, err := io.ReadAll(req.Body)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
@@ -214,15 +214,21 @@ func (s *fakeCTServer) addChain(w http.ResponseWriter, req *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusOK)
-	w.Write(respBytes)
+	if _, err := w.Write(respBytes); err != nil {
+		klog.Errorf("Write(): %v", err)
+	}
 }
 
 func (s *fakeCTServer) close() {
 	if s.server != nil {
-		s.server.Close()
+		if err := s.server.Close(); err != nil {
+			klog.Errorf("Operation to close server failed: %v", err)
+		}
 	}
 	if s.lis != nil {
-		s.lis.Close()
+		if err := s.lis.Close(); err != nil {
+			klog.Errorf("Operation to close server listener failed: %v", err)
+		}
 	}
 }
 
@@ -231,7 +237,9 @@ func (s *fakeCTServer) reset() {
 }
 
 func (s *fakeCTServer) serve() {
-	s.server.Serve(s.lis)
+	if err := s.server.Serve(s.lis); err != http.ErrServerClosed {
+		panic(err)
+	}
 }
 
 func (s *fakeCTServer) getSTH(w http.ResponseWriter, req *http.Request) {
@@ -254,7 +262,9 @@ func (s *fakeCTServer) getSTH(w http.ResponseWriter, req *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusOK)
-	w.Write(respBytes)
+	if _, err := w.Write(respBytes); err != nil {
+		klog.Errorf("Write(): %v", err)
+	}
 }
 
 func (s *fakeCTServer) getConsistency(w http.ResponseWriter, req *http.Request) {
@@ -268,14 +278,18 @@ func (s *fakeCTServer) getConsistency(w http.ResponseWriter, req *http.Request) 
 	}
 
 	w.WriteHeader(http.StatusOK)
-	w.Write(respBytes)
+	if _, err := w.Write(respBytes); err != nil {
+		klog.Errorf("Write(): %v", err)
+	}
 
 	s.getConsistencyCalled = true
 }
 
 func writeErr(w http.ResponseWriter, status int, err error) {
 	w.WriteHeader(status)
-	io.WriteString(w, err.Error())
+	if _, err := io.WriteString(w, err.Error()); err != nil {
+		klog.Errorf("WriteString(): %v", err)
+	}
 }
 
 // newFakeCTServer creates and starts a fakeCTServer.

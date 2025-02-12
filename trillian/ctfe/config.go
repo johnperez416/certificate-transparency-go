@@ -18,34 +18,39 @@ import (
 	"crypto"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"os"
+	"strings"
 	"time"
 
-	"github.com/golang/glog"
+	"github.com/go-sql-driver/mysql"
 	ct "github.com/google/certificate-transparency-go"
 	"github.com/google/certificate-transparency-go/trillian/ctfe/configpb"
 	"github.com/google/certificate-transparency-go/x509"
+	"github.com/jackc/pgx/v5/pgconn"
 	"google.golang.org/protobuf/encoding/prototext"
 	"google.golang.org/protobuf/proto"
+	"k8s.io/klog/v2"
 )
 
 // ValidatedLogConfig represents the LogConfig with the information that has
 // been successfully parsed as a result of validating it.
 type ValidatedLogConfig struct {
-	Config        *configpb.LogConfig
-	PubKey        crypto.PublicKey
-	PrivKey       proto.Message
-	KeyUsages     []x509.ExtKeyUsage
-	NotAfterStart *time.Time
-	NotAfterLimit *time.Time
-	FrozenSTH     *ct.SignedTreeHead
+	Config                               *configpb.LogConfig
+	PubKey                               crypto.PublicKey
+	PrivKey                              proto.Message
+	KeyUsages                            []x509.ExtKeyUsage
+	NotAfterStart                        *time.Time
+	NotAfterLimit                        *time.Time
+	FrozenSTH                            *ct.SignedTreeHead
+	CTFEStorageConnectionString          string
+	ExtraDataIssuanceChainStorageBackend configpb.LogConfig_IssuanceChainStorageBackend
 }
 
 // LogConfigFromFile creates a slice of LogConfig options from the given
 // filename, which should contain text or binary-encoded protobuf configuration
 // data.
 func LogConfigFromFile(filename string) ([]*configpb.LogConfig, error) {
-	cfgBytes, err := ioutil.ReadFile(filename)
+	cfgBytes, err := os.ReadFile(filename)
 	if err != nil {
 		return nil, err
 	}
@@ -81,7 +86,7 @@ func ToMultiLogConfig(cfg []*configpb.LogConfig, beSpec string) *configpb.LogMul
 // filename, which should contain text or binary-encoded protobuf configuration data.
 // Does not do full validation of the config but checks that it is non empty.
 func MultiLogConfigFromFile(filename string) (*configpb.LogMultiConfig, error) {
-	cfgBytes, err := ioutil.ReadFile(filename)
+	cfgBytes, err := os.ReadFile(filename)
 	if err != nil {
 		return nil, err
 	}
@@ -100,12 +105,13 @@ func MultiLogConfigFromFile(filename string) (*configpb.LogMultiConfig, error) {
 }
 
 // ValidateLogConfig checks that a single log config is valid. In particular:
-//  - A mirror log has a valid public key and no private key.
-//  - A non-mirror log has a private, and optionally a public key (both valid).
-//  - Each of NotBeforeStart and NotBeforeLimit, if set, is a valid timestamp
-//    proto. If both are set then NotBeforeStart <= NotBeforeLimit.
-//  - Merge delays (if present) are correct.
-//  - Frozen STH (if present) is correct and signed by the provided public key.
+//   - A mirror log has a valid public key and no private key.
+//   - A non-mirror log has a private, and optionally a public key (both valid).
+//   - Each of NotBeforeStart and NotBeforeLimit, if set, is a valid timestamp
+//     proto. If both are set then NotBeforeStart <= NotBeforeLimit.
+//   - Merge delays (if present) are correct.
+//   - Frozen STH (if present) is correct and signed by the provided public key.
+//
 // Returns the validated structures (useful to avoid double validation).
 func ValidateLogConfig(cfg *configpb.LogConfig) (*ValidatedLogConfig, error) {
 	if cfg.LogId == 0 {
@@ -151,7 +157,7 @@ func ValidateLogConfig(cfg *configpb.LogConfig) (*ValidatedLogConfig, error) {
 				// If "Any" is specified, then we can ignore the entire list and
 				// just disable EKU checking.
 				if ku == x509.ExtKeyUsageAny {
-					glog.Infof("%s: Found ExtKeyUsageAny, allowing all EKUs", cfg.Prefix)
+					klog.Infof("%s: Found ExtKeyUsageAny, allowing all EKUs", cfg.Prefix)
 					vCfg.KeyUsages = nil
 					break
 				}
@@ -208,6 +214,30 @@ func ValidateLogConfig(cfg *configpb.LogConfig) (*ValidatedLogConfig, error) {
 			return nil, fmt.Errorf("signature verification failed: %v", err)
 		}
 	}
+
+	switch cfg.ExtraDataIssuanceChainStorageBackend {
+	case configpb.LogConfig_ISSUANCE_CHAIN_STORAGE_BACKEND_CTFE:
+		// Validate the combination of CtfeStorageConnectionString and ExtraDataIssuanceChainStorageBackend
+		if len(cfg.CtfeStorageConnectionString) == 0 {
+			return nil, errors.New("missing ctfe_storage_connection_string when issuance chain storage backend is CTFE")
+		}
+		// Validate CTFEStorageConnectionString
+		if strings.HasPrefix(cfg.CtfeStorageConnectionString, "mysql") {
+			if _, err := mysql.ParseDSN(strings.Split(cfg.CtfeStorageConnectionString, "://")[1]); err != nil {
+				return nil, errors.New("failed to parse ctfe_storage_connection_string for mysql driver")
+			}
+		} else if strings.HasPrefix(cfg.CtfeStorageConnectionString, "postgres") {
+			if _, err := pgconn.ParseConfig(cfg.CtfeStorageConnectionString); err != nil {
+				return nil, errors.New("failed to parse ctfe_storage_connection_string for postgresql pgx driver")
+			}
+		} else {
+			return nil, errors.New("unsupported driver in ctfe_storage_connection_string")
+		}
+		vCfg.CTFEStorageConnectionString = cfg.CtfeStorageConnectionString
+	case configpb.LogConfig_ISSUANCE_CHAIN_STORAGE_BACKEND_TRILLIAN_GRPC:
+		// Nothing to validate for Trillian gRPC
+	}
+	vCfg.ExtraDataIssuanceChainStorageBackend = cfg.ExtraDataIssuanceChainStorageBackend
 
 	return &vCfg, nil
 }

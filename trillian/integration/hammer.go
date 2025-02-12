@@ -25,16 +25,17 @@ import (
 	"sync"
 	"time"
 
-	"github.com/golang/glog"
 	"github.com/google/certificate-transparency-go/client"
 	"github.com/google/certificate-transparency-go/schedule"
 	"github.com/google/certificate-transparency-go/tls"
 	"github.com/google/certificate-transparency-go/trillian/ctfe"
 	"github.com/google/certificate-transparency-go/trillian/ctfe/configpb"
 	"github.com/google/certificate-transparency-go/x509"
-	"github.com/google/trillian/merkle/logverifier"
-	"github.com/google/trillian/merkle/rfc6962"
 	"github.com/google/trillian/monitoring"
+	"github.com/transparency-dev/merkle"
+	"github.com/transparency-dev/merkle/proof"
+	"github.com/transparency-dev/merkle/rfc6962"
+	"k8s.io/klog/v2"
 
 	ct "github.com/google/certificate-transparency-go"
 )
@@ -99,12 +100,13 @@ const (
 // Limiter is an interface to allow different rate limiters to be used with the
 // hammer.
 type Limiter interface {
-	Wait()
+	Wait(context.Context) error
 }
 
 type unLimited struct{}
 
-func (u unLimited) Wait() {
+func (u unLimited) Wait(ctx context.Context) error {
+	return nil
 }
 
 // HammerConfig provides configuration for a stress/load test.
@@ -131,7 +133,7 @@ type HammerConfig struct {
 	// Rate limiter
 	Limiter Limiter
 	// MaxParallelChains sets the upper limit for the number of parallel
-	// add-*-chain requests to make when the biasing model says to perfom an add.
+	// add-*-chain requests to make when the biasing model says to perform an add.
 	MaxParallelChains int
 	// EmitInterval defines how frequently stats are logged.
 	EmitInterval time.Duration
@@ -303,8 +305,8 @@ type hammerState struct {
 	pending pendingCerts
 	// Operations that are required to fix dependencies.
 	nextOp []ctfe.EntrypointName
-	// verifier is the verifier to be used for this log.
-	verifier logverifier.LogVerifier
+
+	hasher merkle.LogHasher
 }
 
 func newHammerState(cfg *HammerConfig) (*hammerState, error) {
@@ -330,15 +332,15 @@ func newHammerState(cfg *HammerConfig) (*hammerState, error) {
 	}
 
 	if cfg.LogCfg.IsMirror {
-		glog.Warningf("%v: disabling add-[pre-]chain for mirror log", cfg.LogCfg.Prefix)
+		klog.Warningf("%v: disabling add-[pre-]chain for mirror log", cfg.LogCfg.Prefix)
 		cfg.EPBias.Bias[ctfe.AddChainName] = 0
 		cfg.EPBias.Bias[ctfe.AddPreChainName] = 0
 	}
 
 	state := hammerState{
-		cfg:      cfg,
-		nextOp:   make([]ctfe.EntrypointName, 0),
-		verifier: logverifier.New(rfc6962.DefaultHasher),
+		cfg:    cfg,
+		nextOp: make([]ctfe.EntrypointName, 0),
+		hasher: rfc6962.DefaultHasher,
 	}
 	return &state, nil
 }
@@ -355,7 +357,7 @@ func (s *hammerState) lastTreeSize() uint64 {
 }
 
 func (s *hammerState) needOps(ops ...ctfe.EntrypointName) {
-	glog.V(2).Infof("need operations %+v to satisfy dependencies", ops)
+	klog.V(2).Infof("need operations %+v to satisfy dependencies", ops)
 	s.nextOp = append(s.nextOp, ops...)
 }
 
@@ -365,7 +367,7 @@ func (s *hammerState) needOps(ops ...ctfe.EntrypointName) {
 func (s *hammerState) addMultiple(ctx context.Context, addOne func(context.Context) error) error {
 	var wg sync.WaitGroup
 	numAdds := rand.Intn(s.cfg.MaxParallelChains) + 1
-	glog.V(2).Infof("%s: do %d parallel add operations...", s.cfg.LogCfg.Prefix, numAdds)
+	klog.V(2).Infof("%s: do %d parallel add operations...", s.cfg.LogCfg.Prefix, numAdds)
 	errs := make(chan error, numAdds)
 	for i := 0; i < numAdds; i++ {
 		wg.Add(1)
@@ -377,7 +379,7 @@ func (s *hammerState) addMultiple(ctx context.Context, addOne func(context.Conte
 		}()
 	}
 	wg.Wait()
-	glog.V(2).Infof("%s: do %d parallel add operations...done", s.cfg.LogCfg.Prefix, numAdds)
+	klog.V(2).Infof("%s: do %d parallel add operations...done", s.cfg.LogCfg.Prefix, numAdds)
 	select {
 	case err := <-errs:
 		return err
@@ -427,11 +429,11 @@ func (s *hammerState) addChain(ctx context.Context) error {
 	sct, err := s.client().AddChain(ctx, chain)
 	if err != nil {
 		if err, ok := err.(client.RspError); ok {
-			glog.Errorf("%s: add-chain(%s): error %v HTTP status %d body %s", s.cfg.LogCfg.Prefix, choice, err.Error(), err.StatusCode, err.Body)
+			klog.Errorf("%s: add-chain(%s): error %v HTTP status %d body %s", s.cfg.LogCfg.Prefix, choice, err.Error(), err.StatusCode, err.Body)
 		}
 		return fmt.Errorf("failed to add-chain(%s): %v", choice, err)
 	}
-	glog.V(2).Infof("%s: Uploaded %s cert, got SCT(time=%q)", s.cfg.LogCfg.Prefix, choice, timeFromMS(sct.Timestamp))
+	klog.V(2).Infof("%s: Uploaded %s cert, got SCT(time=%q)", s.cfg.LogCfg.Prefix, choice, timeFromMS(sct.Timestamp))
 	// Calculate leaf hash =  SHA256(0x00 | tls-encode(MerkleTreeLeaf))
 	submitted := submittedCert{precert: false, sct: sct}
 	leaf := ct.MerkleTreeLeaf{
@@ -451,7 +453,7 @@ func (s *hammerState) addChain(ctx context.Context) error {
 	}
 	submitted.leafHash = sha256.Sum256(append([]byte{ct.TreeLeafPrefix}, submitted.leafData...))
 	s.pending.tryAppendCert(time.Now(), s.cfg.MMD, &submitted)
-	glog.V(3).Infof("%s: Uploaded %s cert has leaf-hash %x", s.cfg.LogCfg.Prefix, choice, submitted.leafHash)
+	klog.V(3).Infof("%s: Uploaded %s cert has leaf-hash %x", s.cfg.LogCfg.Prefix, choice, submitted.leafHash)
 	return nil
 }
 
@@ -483,13 +485,13 @@ func (s *hammerState) addChainInvalid(ctx context.Context) error {
 		// Remove the initial ASN.1 SEQUENCE type byte (0x30) to make an unparsable cert.
 		chain[0].Data[0] = 0x00
 	default:
-		glog.Exitf("Unhandled choice %s", choice)
+		klog.Exitf("Unhandled choice %s", choice)
 	}
 
 	sct, err := s.client().AddChain(ctx, chain)
-	glog.V(3).Infof("invalid add-chain(%s) => error %v", choice, err)
+	klog.V(3).Infof("invalid add-chain(%s) => error %v", choice, err)
 	if err, ok := err.(client.RspError); ok {
-		glog.V(3).Infof("   HTTP status %d body %s", err.StatusCode, err.Body)
+		klog.V(3).Infof("   HTTP status %d body %s", err.StatusCode, err.Body)
 	}
 	if err == nil {
 		return fmt.Errorf("unexpected success: add-chain(%s): %+v", choice, sct)
@@ -553,11 +555,11 @@ func (s *hammerState) addPreChain(ctx context.Context) error {
 	sct, err := s.client().AddPreChain(ctx, prechain)
 	if err != nil {
 		if err, ok := err.(client.RspError); ok {
-			glog.Errorf("%s: add-pre-chain(%s): error %v HTTP status %d body %s", s.cfg.LogCfg.Prefix, choice, err.Error(), err.StatusCode, err.Body)
+			klog.Errorf("%s: add-pre-chain(%s): error %v HTTP status %d body %s", s.cfg.LogCfg.Prefix, choice, err.Error(), err.StatusCode, err.Body)
 		}
 		return fmt.Errorf("failed to add-pre-chain: %v", err)
 	}
-	glog.V(2).Infof("%s: Uploaded %s pre-cert, got SCT(time=%q)", s.cfg.LogCfg.Prefix, choice, timeFromMS(sct.Timestamp))
+	klog.V(2).Infof("%s: Uploaded %s pre-cert, got SCT(time=%q)", s.cfg.LogCfg.Prefix, choice, timeFromMS(sct.Timestamp))
 
 	// Calculate leaf hash =  SHA256(0x00 | tls-encode(MerkleTreeLeaf))
 	submitted := submittedCert{precert: true, sct: sct}
@@ -581,7 +583,7 @@ func (s *hammerState) addPreChain(ctx context.Context) error {
 	}
 	submitted.leafHash = sha256.Sum256(append([]byte{ct.TreeLeafPrefix}, submitted.leafData...))
 	s.pending.tryAppendCert(time.Now(), s.cfg.MMD, &submitted)
-	glog.V(3).Infof("%s: Uploaded %s pre-cert has leaf-hash %x", s.cfg.LogCfg.Prefix, choice, submitted.leafHash)
+	klog.V(3).Infof("%s: Uploaded %s pre-cert has leaf-hash %x", s.cfg.LogCfg.Prefix, choice, submitted.leafHash)
 	return nil
 }
 
@@ -613,13 +615,13 @@ func (s *hammerState) addPreChainInvalid(ctx context.Context) error {
 		// Remove the initial ASN.1 SEQUENCE type byte (0x30) to make an unparsable cert.
 		prechain[0].Data[0] = 0x00
 	default:
-		glog.Exitf("Unhandled choice %s", choice)
+		klog.Exitf("Unhandled choice %s", choice)
 	}
 
 	sct, err := s.client().AddPreChain(ctx, prechain)
-	glog.V(3).Infof("invalid add-pre-chain(%s) => error %v", choice, err)
+	klog.V(3).Infof("invalid add-pre-chain(%s) => error %v", choice, err)
 	if err, ok := err.(client.RspError); ok {
-		glog.V(3).Infof("   HTTP status %d body %s", err.StatusCode, err.Body)
+		klog.V(3).Infof("   HTTP status %d body %s", err.StatusCode, err.Body)
 	}
 	if err == nil {
 		return fmt.Errorf("unexpected success: add-pre-chain: %+v", sct)
@@ -637,7 +639,7 @@ func (s *hammerState) getSTH(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to get-sth: %v", err)
 	}
-	glog.V(2).Infof("%s: Got STH(time=%q, size=%d)", s.cfg.LogCfg.Prefix, timeFromMS(s.sth[0].Timestamp), s.sth[0].TreeSize)
+	klog.V(2).Infof("%s: Got STH(time=%q, size=%d)", s.cfg.LogCfg.Prefix, timeFromMS(s.sth[0].Timestamp), s.sth[0].TreeSize)
 	return nil
 }
 
@@ -650,17 +652,17 @@ func (s *hammerState) chooseSTHs(ctx context.Context) (*ct.SignedTreeHead, *ct.S
 	}
 	which := rand.Intn(sthCount)
 	if s.sth[which] == nil {
-		glog.V(3).Infof("%s: skipping get-sth-consistency as no earlier STH", s.cfg.LogCfg.Prefix)
+		klog.V(3).Infof("%s: skipping get-sth-consistency as no earlier STH", s.cfg.LogCfg.Prefix)
 		s.needOps(ctfe.GetSTHName)
 		return nil, sthNow, errSkip{}
 	}
 	if s.sth[which].TreeSize == 0 {
-		glog.V(3).Infof("%s: skipping get-sth-consistency as no earlier STH", s.cfg.LogCfg.Prefix)
+		klog.V(3).Infof("%s: skipping get-sth-consistency as no earlier STH", s.cfg.LogCfg.Prefix)
 		s.needOps(ctfe.AddChainName, ctfe.GetSTHName)
 		return nil, sthNow, errSkip{}
 	}
 	if s.sth[which].TreeSize == sthNow.TreeSize {
-		glog.V(3).Infof("%s: skipping get-sth-consistency as same size (%d)", s.cfg.LogCfg.Prefix, sthNow.TreeSize)
+		klog.V(3).Infof("%s: skipping get-sth-consistency as same size (%d)", s.cfg.LogCfg.Prefix, sthNow.TreeSize)
 		s.needOps(ctfe.AddChainName, ctfe.GetSTHName)
 		return nil, sthNow, errSkip{}
 	}
@@ -683,11 +685,11 @@ func (s *hammerState) getSTHConsistency(ctx context.Context) error {
 
 		// Otherwise, let's use our imagination and make one up, if possible...
 		if sthNow.TreeSize < 2 {
-			glog.V(3).Infof("%s: current STH size too small to invent a smaller STH for consistency proof (%d)", s.cfg.LogCfg.Prefix, sthNow.TreeSize)
+			klog.V(3).Infof("%s: current STH size too small to invent a smaller STH for consistency proof (%d)", s.cfg.LogCfg.Prefix, sthNow.TreeSize)
 			return errSkip{}
 		}
 		sthOld = &ct.SignedTreeHead{TreeSize: uint64(1 + rand.Int63n(int64(sthNow.TreeSize)))}
-		glog.V(3).Infof("%s: Inventing a smaller STH size for consistency proof (%d)", s.cfg.LogCfg.Prefix, sthOld.TreeSize)
+		klog.V(3).Infof("%s: Inventing a smaller STH size for consistency proof (%d)", s.cfg.LogCfg.Prefix, sthOld.TreeSize)
 	}
 
 	proof, err := s.client().GetSTHConsistency(ctx, sthOld.TreeSize, sthNow.TreeSize)
@@ -695,14 +697,14 @@ func (s *hammerState) getSTHConsistency(ctx context.Context) error {
 		return fmt.Errorf("failed to get-sth-consistency(%d, %d): %v", sthOld.TreeSize, sthNow.TreeSize, err)
 	}
 	if sthOld.Timestamp == 0 {
-		glog.V(3).Infof("%s: Skipping consistency proof verification for invented STH", s.cfg.LogCfg.Prefix)
+		klog.V(3).Infof("%s: Skipping consistency proof verification for invented STH", s.cfg.LogCfg.Prefix)
 		return nil
 	}
 
 	if err := s.checkCTConsistencyProof(sthOld, sthNow, proof); err != nil {
 		return fmt.Errorf("get-sth-consistency(%d, %d) proof check failed: %v", sthOld.TreeSize, sthNow.TreeSize, err)
 	}
-	glog.V(2).Infof("%s: Got STH consistency proof (size=%d => %d) len %d",
+	klog.V(2).Infof("%s: Got STH consistency proof (size=%d => %d) len %d",
 		s.cfg.LogCfg.Prefix, sthOld.TreeSize, sthNow.TreeSize, len(proof))
 	return nil
 }
@@ -754,12 +756,12 @@ func (s *hammerState) getSTHConsistencyInvalid(ctx context.Context) error {
 		}
 		proof = resp.Consistency
 	default:
-		glog.Exitf("Unhandled choice %s", choice)
+		klog.Exitf("Unhandled choice %s", choice)
 	}
 
-	glog.V(3).Infof("invalid get-sth-consistency(%s) => error %v", choice, err)
+	klog.V(3).Infof("invalid get-sth-consistency(%s) => error %v", choice, err)
 	if err, ok := err.(client.RspError); ok {
-		glog.V(3).Infof("   HTTP status %d body %s", err.StatusCode, err.Body)
+		klog.V(3).Infof("   HTTP status %d body %s", err.StatusCode, err.Body)
 	}
 	if err == nil {
 		return fmt.Errorf("unexpected success: get-sth-consistency(%s): %+v", choice, proof)
@@ -783,8 +785,8 @@ func (s *hammerState) getProofByHash(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to get-proof-by-hash(size=%d) on cert with SCT @ %v: %v, %+v", sth.TreeSize, timeFromMS(submitted.sct.Timestamp), err, rsp)
 	}
-	if err := s.verifier.VerifyInclusionProof(rsp.LeafIndex, int64(sth.TreeSize), rsp.AuditPath, sth.SHA256RootHash[:], submitted.leafHash[:]); err != nil {
-		return fmt.Errorf("failed to VerifyInclusionProof(%d, %d)=%v", rsp.LeafIndex, sth.TreeSize, err)
+	if err := proof.VerifyInclusion(s.hasher, uint64(rsp.LeafIndex), sth.TreeSize, submitted.leafHash[:], rsp.AuditPath, sth.SHA256RootHash[:]); err != nil {
+		return fmt.Errorf("failed to VerifyInclusion(%d, %d)=%v", rsp.LeafIndex, sth.TreeSize, err)
 	}
 	s.pending.dropOldest()
 	return nil
@@ -832,12 +834,12 @@ func (s *hammerState) getProofByHashInvalid(ctx context.Context) error {
 			err = client.RspError{Err: err, StatusCode: httpRsp.StatusCode, Body: body}
 		}
 	default:
-		glog.Exitf("Unhandled choice %s", choice)
+		klog.Exitf("Unhandled choice %s", choice)
 	}
 
-	glog.V(3).Infof("invalid get-proof-by-hash(%s) => error %v", choice, err)
+	klog.V(3).Infof("invalid get-proof-by-hash(%s) => error %v", choice, err)
 	if err, ok := err.(client.RspError); ok {
-		glog.V(3).Infof("   HTTP status %d body %s", err.StatusCode, err.Body)
+		klog.V(3).Infof("   HTTP status %d body %s", err.StatusCode, err.Body)
 	}
 	if err == nil {
 		return fmt.Errorf("unexpected success: get-proof-by-hash(%s): %+v", choice, rsp)
@@ -847,18 +849,18 @@ func (s *hammerState) getProofByHashInvalid(ctx context.Context) error {
 
 func (s *hammerState) getEntries(ctx context.Context) error {
 	if s.sth[0] == nil {
-		glog.V(3).Infof("%s: skipping get-entries as no earlier STH", s.cfg.LogCfg.Prefix)
+		klog.V(3).Infof("%s: skipping get-entries as no earlier STH", s.cfg.LogCfg.Prefix)
 		s.needOps(ctfe.GetSTHName)
 		return errSkip{}
 	}
 	lastSize := s.lastTreeSize()
 	if lastSize == 0 {
 		if s.pending.empty() {
-			glog.V(3).Infof("%s: skipping get-entries as tree size 0", s.cfg.LogCfg.Prefix)
+			klog.V(3).Infof("%s: skipping get-entries as tree size 0", s.cfg.LogCfg.Prefix)
 			s.needOps(ctfe.AddChainName, ctfe.GetSTHName)
 			return errSkip{}
 		}
-		glog.V(3).Infof("%s: skipping get-entries as STH stale", s.cfg.LogCfg.Prefix)
+		klog.V(3).Infof("%s: skipping get-entries as STH stale", s.cfg.LogCfg.Prefix)
 		s.needOps(ctfe.GetSTHName)
 		return errSkip{}
 	}
@@ -893,7 +895,7 @@ func (s *hammerState) getEntries(ctx context.Context) error {
 			return fmt.Errorf("leaf[%d].ts.EntryType=%v; want {X509,Precert}LogEntryType", i, ts.EntryType)
 		}
 	}
-	glog.V(2).Infof("%s: Got entries [%d:%d)\n", s.cfg.LogCfg.Prefix, first, first+len(entries))
+	klog.V(2).Infof("%s: Got entries [%d:%d)\n", s.cfg.LogCfg.Prefix, first, first+len(entries))
 	return nil
 }
 
@@ -918,13 +920,13 @@ func (s *hammerState) getEntriesInvalid(ctx context.Context) error {
 		first = 10
 		last = 5
 	default:
-		glog.Exitf("Unhandled choice %s", choice)
+		klog.Exitf("Unhandled choice %s", choice)
 	}
 
 	entries, err := s.client().GetEntries(ctx, first, last)
-	glog.V(3).Infof("invalid get-entries(%s) => error %v", choice, err)
+	klog.V(3).Infof("invalid get-entries(%s) => error %v", choice, err)
 	if err, ok := err.(client.RspError); ok {
-		glog.V(3).Infof("   HTTP status %d body %s", err.StatusCode, err.Body)
+		klog.V(3).Infof("   HTTP status %d body %s", err.StatusCode, err.Body)
 	}
 	if err == nil {
 		return fmt.Errorf("unexpected success: get-entries(%d,%d): %d entries", first, last, len(entries))
@@ -937,7 +939,7 @@ func (s *hammerState) getRoots(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to get-roots: %v", err)
 	}
-	glog.V(2).Infof("%s: Got roots (len=%d)", s.cfg.LogCfg.Prefix, len(roots))
+	klog.V(2).Infof("%s: Got roots (len=%d)", s.cfg.LogCfg.Prefix, len(roots))
 	return nil
 }
 
@@ -974,7 +976,9 @@ func (s *hammerState) String() string {
 }
 
 func (s *hammerState) performOp(ctx context.Context, ep ctfe.EntrypointName) (int, error) {
-	s.cfg.Limiter.Wait()
+	if err := s.cfg.Limiter.Wait(ctx); err != nil {
+		return http.StatusRequestTimeout, fmt.Errorf("Limiter.Wait(): %v", err)
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1004,7 +1008,7 @@ func (s *hammerState) performOp(ctx context.Context, ep ctfe.EntrypointName) (in
 		err = s.getRoots(ctx)
 	case ctfe.GetEntryAndProofName:
 		status = http.StatusNotImplemented
-		glog.V(2).Infof("%s: hammering entrypoint %s not yet implemented", s.cfg.LogCfg.Prefix, ep)
+		klog.V(2).Infof("%s: hammering entrypoint %s not yet implemented", s.cfg.LogCfg.Prefix, ep)
 	default:
 		err = fmt.Errorf("internal error: unknown entrypoint %s selected", ep)
 	}
@@ -1012,7 +1016,9 @@ func (s *hammerState) performOp(ctx context.Context, ep ctfe.EntrypointName) (in
 }
 
 func (s *hammerState) performInvalidOp(ctx context.Context, ep ctfe.EntrypointName) error {
-	s.cfg.Limiter.Wait()
+	if err := s.cfg.Limiter.Wait(ctx); err != nil {
+		return fmt.Errorf("Limiter.Wait(): %v", err)
+	}
 	switch ep {
 	case ctfe.AddChainName:
 		return s.addChainInvalid(ctx)
@@ -1052,20 +1058,23 @@ func (s *hammerState) chooseOp() (ctfe.EntrypointName, bool) {
 func (s *hammerState) retryOneOp(ctx context.Context) error {
 	ep, invalid := s.chooseOp()
 	if invalid {
-		glog.V(3).Infof("perform invalid %s operation", ep)
+		klog.V(3).Infof("perform invalid %s operation", ep)
 		invalidReqs.Inc(s.label(), string(ep))
 		err := s.performInvalidOp(ctx, ep)
 		if _, ok := err.(errSkip); ok {
-			glog.V(2).Infof("invalid operation %s was skipped", ep)
+			klog.V(2).Infof("invalid operation %s was skipped", ep)
 			return nil
 		}
 		return err
 	}
 
-	glog.V(3).Infof("perform %s operation", ep)
+	klog.V(3).Infof("perform %s operation", ep)
 	deadline := time.Now().Add(s.cfg.MaxRetryDuration)
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		start := time.Now()
 		reqs.Inc(s.label(), string(ep))
 		status, err := s.performOp(ctx, ep)
@@ -1077,17 +1086,17 @@ func (s *hammerState) retryOneOp(ctx context.Context) error {
 			rsps.Inc(s.label(), string(ep), strconv.Itoa(status))
 			return nil
 		case errSkip:
-			glog.V(2).Infof("operation %s was skipped", ep)
+			klog.V(2).Infof("operation %s was skipped", ep)
 			return nil
 		default:
 			errs.Inc(s.label(), string(ep))
 			if s.cfg.IgnoreErrors {
 				left := time.Until(deadline)
 				if left < 0 {
-					glog.Warningf("%s: gave up retrying failed op %v after %v, returning last err: %v", s.cfg.LogCfg.Prefix, ep, s.cfg.MaxRetryDuration, err)
+					klog.Warningf("%s: gave up retrying failed op %v after %v, returning last err: %v", s.cfg.LogCfg.Prefix, ep, s.cfg.MaxRetryDuration, err)
 					return err
 				}
-				glog.Warningf("%s: op %v failed after %v (will retry for %v more): %v", s.cfg.LogCfg.Prefix, ep, period, left, err)
+				klog.Warningf("%s: op %v failed after %v (will retry for %v more): %v", s.cfg.LogCfg.Prefix, ep, period, left, err)
 			} else {
 				return err
 			}
@@ -1096,30 +1105,33 @@ func (s *hammerState) retryOneOp(ctx context.Context) error {
 }
 
 // checkCTConsistencyProof checks the given consistency proof.
-func (s *hammerState) checkCTConsistencyProof(sth1, sth2 *ct.SignedTreeHead, proof [][]byte) error {
-	return s.verifier.VerifyConsistencyProof(int64(sth1.TreeSize), int64(sth2.TreeSize),
-		sth1.SHA256RootHash[:], sth2.SHA256RootHash[:], proof)
+func (s *hammerState) checkCTConsistencyProof(sth1, sth2 *ct.SignedTreeHead, pf [][]byte) error {
+	return proof.VerifyConsistency(s.hasher, sth1.TreeSize, sth2.TreeSize, pf, sth1.SHA256RootHash[:], sth2.SHA256RootHash[:])
 }
 
 // HammerCTLog performs load/stress operations according to given config.
-func HammerCTLog(cfg HammerConfig) error {
+func HammerCTLog(ctx context.Context, cfg HammerConfig) error {
 	s, err := newHammerState(&cfg)
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	go schedule.Every(ctx, cfg.EmitInterval, func(ctx context.Context) {
-		glog.Info(s.String())
+		klog.Info(s.String())
 	})
 
 	for count := uint64(1); count < cfg.Operations; count++ {
 		if err := s.retryOneOp(ctx); err != nil {
 			return err
 		}
+		// Terminate from the loop if the context is cancelled.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 	}
-	glog.Infof("%s: completed %d operations on log", cfg.LogCfg.Prefix, cfg.Operations)
+	klog.Infof("%s: completed %d operations on log", cfg.LogCfg.Prefix, cfg.Operations)
 
 	return nil
 }
