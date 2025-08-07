@@ -1,4 +1,4 @@
-FROM golang:1.24.5-bookworm@sha256:ef8c5c733079ac219c77edab604c425d748c740d8699530ea6aced9de79aea40 as build
+FROM golang:1.24.6-bookworm@sha256:2679c15c940573aded505b2f2fbbd4e718b5172327aae3ab9f43a10a5c700dfc as build
 
 ARG GOFLAGS=""
 ENV GOFLAGS=$GOFLAGS
@@ -12,7 +12,7 @@ COPY . .
 
 RUN go build ./trillian/ctfe/ct_server
 
-FROM gcr.io/distroless/base-debian12@sha256:201ef9125ff3f55fda8e0697eff0b3ce9078366503ef066653635a3ac3ed9c26
+FROM gcr.io/distroless/base-debian12@sha256:1951bedd9ab20dd71a5ab11b3f5a624863d7af4109f299d62289928b9e311d5d
 
 COPY --from=build /build/ct_server /
 
